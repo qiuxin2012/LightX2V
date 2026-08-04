@@ -44,22 +44,14 @@ MiniMax-H3/
 - `module`：整个 DiT 在去噪开始前搬到设备，结束后搬回 CPU；旧配置值 `model` 作为兼容别名保留。
 - `block`：50 个 transformer blocks 常驻 pinned CPU memory，设备上保留两个 block buffer，计算当前 block 时异步预取下一个 block。
 
-DiT 支持 Ulysses sequence parallel。H3 的 video rows 在 SP ranks 间切分，变长的 text/audio rows 在组内复制，因此不会为 packed sequence 引入会污染 softmax 的 padding token。当前只支持 `seq_p_attn_type: "ulysses"`，且 `seq_p_size` 必须整除 56 个 attention heads（例如 2、4、7、8）。两卡示例：
+DiT 支持 Ulysses sequence parallel。H3 的 video rows 在 SP ranks 间切分，变长的 text/audio rows 在组内复制，因此不会为 packed sequence 引入会污染 softmax 的 padding token。当前只支持 `seq_p_attn_type: "ulysses"`，且 `seq_p_size` 必须整除 56 个 attention heads（例如 2、4、7、8）。默认使用 4 卡：
 
 ```bash
 MODEL_PATH=/llm/models/MiniMax-H3/FL2VA \
 bash scripts/minimax_h3/run_minimax_h3_t2av_ulysses.sh
 ```
 
-对应配置为 `configs/minimax_h3/minimax_h3_t2av_ulysses.json`。如需修改卡数，必须同时修改配置中的 `parallel.seq_p_size` 和脚本的 `NUM_PROCESSES`。
-
-Ulysses 加 block offload 使用：
-
-```bash
-CONFIG_JSON=configs/minimax_h3/minimax_h3_t2av_ulysses_block_offload.json \
-MODEL_PATH=/llm/models/MiniMax-H3/FL2VA \
-bash scripts/minimax_h3/run_minimax_h3_t2av_ulysses.sh
-```
+脚本默认使用 block offload 配置 `configs/minimax_h3/minimax_h3_t2av_ulysses_block_offload.json`。如需修改卡数，必须同时修改配置中的 `parallel.seq_p_size` 和脚本的 `NUM_PROCESSES`。若要改用 module offload，可通过 `CONFIG_JSON=configs/minimax_h3/minimax_h3_t2av_ulysses.json` 显式指定。
 
 ## CLI
 

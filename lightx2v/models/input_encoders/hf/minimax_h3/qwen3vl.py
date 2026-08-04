@@ -289,6 +289,30 @@ class _Qwen3VLTextBackboneWeights(WeightModule):
     def named_weight_modules(self):
         return self._weight_modules.items()
 
+    @staticmethod
+    def _layer_weight_modules(layer):
+        return (
+            layer.input_layernorm,
+            layer.post_attention_layernorm,
+            layer.self_attn.q_proj,
+            layer.self_attn.k_proj,
+            layer.self_attn.v_proj,
+            layer.self_attn.o_proj,
+            layer.self_attn.q_norm,
+            layer.self_attn.k_norm,
+            layer.mlp.gate_proj,
+            layer.mlp.up_proj,
+            layer.mlp.down_proj,
+        )
+
+    @staticmethod
+    def _restore_host_weights(modules):
+        """Release immutable accelerator copies without copying them back."""
+        for module in modules:
+            pin_weight = getattr(module, "pin_weight", None)
+            if pin_weight is not None:
+                module.weight = pin_weight
+
     @property
     def device(self):
         return self.embed_tokens.weight.device
@@ -307,7 +331,7 @@ class _Qwen3VLTextBackboneWeights(WeightModule):
         # Generate phases and trig values in FP32, then cast at the same output
         # boundary as the released conditioner.
         inv_freq = self._inv_freq.to(device=hidden_states.device, dtype=torch.float32)
-        frequencies = position_ids.to(torch.float32)[..., None] * inv_freq[None, None, :]
+        frequencies = position_ids.to(device=hidden_states.device, dtype=torch.float32)[..., None] * inv_freq[None, None, :]
         frequencies_t = frequencies[0].clone()
         for dim, offset in enumerate((1, 2), start=1):
             frequencies_t[..., slice(offset, self.mrope_section[dim] * 3, 3)] = frequencies[dim, ..., slice(offset, self.mrope_section[dim] * 3, 3)]
@@ -315,21 +339,35 @@ class _Qwen3VLTextBackboneWeights(WeightModule):
         embeddings = torch.cat((frequencies, frequencies), dim=-1)
         return embeddings.cos().to(hidden_states.dtype), embeddings.sin().to(hidden_states.dtype)
 
-    def forward(self, input_ids, position_ids=None, vision_mask=None, vision_embeds=None, deepstack_embeds=None):
+    def forward(self, input_ids, position_ids=None, vision_mask=None, vision_embeds=None, deepstack_embeds=None, layerwise_offload=False):
         if input_ids.ndim != 1:
             raise ValueError(f"MiniMax-H3's native Qwen3-VL backbone expects unbatched token IDs, got {tuple(input_ids.shape)}")
+        if layerwise_offload:
+            self.embed_tokens.to_cuda()
+            input_ids = input_ids.to(self.embed_tokens.weight.device)
         hidden_states = self.embed_tokens.apply(input_ids)
+        if layerwise_offload:
+            self._restore_host_weights((self.embed_tokens,))
+            _empty_device_cache()
         if vision_embeds is not None:
-            if vision_mask is None or int(vision_mask.sum()) != vision_embeds.shape[0]:
+            if vision_mask is None:
+                raise ValueError("Qwen3-VL vision embeddings require a vision mask")
+            vision_mask = vision_mask.to(hidden_states.device)
+            if int(vision_mask.sum()) != vision_embeds.shape[0]:
                 raise ValueError("Qwen3-VL vision placeholder count does not match vision embeddings")
             hidden_states = hidden_states.clone()
             hidden_states[vision_mask] = vision_embeds.to(hidden_states.device, hidden_states.dtype)
         position_embeddings = self._position_embeddings(hidden_states, position_ids)
         for layer_index, layer in enumerate(self.layers):
+            if layerwise_offload:
+                layer.to_cuda()
             hidden_states = layer.forward(hidden_states, position_embeddings)
             if deepstack_embeds is not None and layer_index < len(deepstack_embeds):
                 hidden_states = hidden_states.clone()
                 hidden_states[vision_mask] += deepstack_embeds[layer_index].to(hidden_states.device, hidden_states.dtype)
+            if layerwise_offload:
+                self._restore_host_weights(self._layer_weight_modules(layer))
+                _empty_device_cache()
         return hidden_states
 
     def to_cpu(self, non_blocking=False):
@@ -833,16 +871,21 @@ class MiniMaxH3Qwen3VLTextEncoder:
                     video_grid_thw,
                 )
                 vision_mask, vision_embeds, deepstack = self._encode_vision(input_ids, pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw)
-            if self.cpu_offload:
-                self.text_encoder.to_cuda()
-            device = self.text_encoder.device
-            input_ids = input_ids.to(device)
+            layerwise_offload = self.cpu_offload
+            if not layerwise_offload:
+                device = self.text_encoder.device
+                input_ids = input_ids.to(device)
+                position_ids = None if position_ids is None else position_ids.to(device)
+                vision_mask = None if vision_mask is None else vision_mask.to(device)
+                vision_embeds = None if vision_embeds is None else vision_embeds.to(device)
+                deepstack = None if deepstack is None else [value.to(device) for value in deepstack]
             prompt_embeds = self.text_encoder.forward(
                 input_ids,
-                None if position_ids is None else position_ids.to(device),
-                None if vision_mask is None else vision_mask.to(device),
-                None if vision_embeds is None else vision_embeds.to(device),
-                None if deepstack is None else [value.to(device) for value in deepstack],
+                position_ids,
+                vision_mask,
+                vision_embeds,
+                deepstack,
+                layerwise_offload=layerwise_offload,
             )
             expected_shape = (input_ids.shape[0], MINIMAX_H3_TEXT_HIDDEN_SIZE)
             if tuple(prompt_embeds.shape) != expected_shape:
