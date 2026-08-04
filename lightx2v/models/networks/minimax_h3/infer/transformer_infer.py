@@ -1,8 +1,12 @@
 import torch
 import torch.nn.functional as F
 
+from lightx2v.common.offload.manager import WeightAsyncStreamManager
 from lightx2v.common.transformer_infer.transformer_infer import BaseTransformerInfer
 from lightx2v.utils.envs import GET_DTYPE
+from lightx2v_platform.base.global_var import AI_DEVICE
+
+torch_device_module = getattr(torch, AI_DEVICE)
 
 
 def _apply_rotary_emb(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -23,26 +27,48 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
         self.hidden_size = int(config.get("hidden_size", 5376))
         self.num_heads = int(config.get("num_attention_heads", 56))
         self.head_dim = int(config.get("attention_head_dim", 128))
+        self.seq_parallel = config.get("seq_parallel", False)
+        self.seq_p_group = config.get("device_mesh").get_group(mesh_dim="seq_p") if self.seq_parallel else None
+        self.block_offload = config.get("cpu_offload", False) and config.get("offload_granularity") == "block"
+        if self.block_offload:
+            self.offload_manager = WeightAsyncStreamManager(offload_granularity="block")
         self.init_compile(config)
 
-    def _attention(self, weights, hidden_states, rotary_emb):
+    def _attention(self, weights, hidden_states, rotary_emb, sp_local_video_length=0):
         q = weights.to_q.apply(hidden_states).unflatten(-1, (self.num_heads, self.head_dim))
         k = weights.to_k.apply(hidden_states).unflatten(-1, (self.num_heads, self.head_dim))
         v = weights.to_v.apply(hidden_states).unflatten(-1, (self.num_heads, self.head_dim))
         q = _apply_rotary_emb(weights.norm_q.apply(q), *rotary_emb)
         k = _apply_rotary_emb(weights.norm_k.apply(k), *rotary_emb)
-        seq_len = q.shape[0]
-        cu_seqlens = torch.tensor((0, seq_len), dtype=torch.int32, device=q.device)
-        out = weights.calculate.apply(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_kv=cu_seqlens,
-            max_seqlen_q=seq_len,
-            max_seqlen_kv=seq_len,
-            causal=False,
-        )
+        if self.seq_parallel:
+            main = slice(0, sp_local_video_length)
+            aux = slice(sp_local_video_length, None)
+            out, aux_out = weights.parallel.apply_new(
+                q=q[main],
+                k=k[main],
+                v=v[main],
+                aux_q=q[aux],
+                aux_k=k[aux],
+                aux_v=v[aux],
+                attention_module=weights.calculate,
+                seq_p_group=self.seq_p_group,
+                aux_first=False,
+                attention_kwargs={"causal": False},
+            )
+            out = torch.cat((out, aux_out), dim=0)
+        else:
+            seq_len = q.shape[0]
+            cu_seqlens = torch.tensor((0, seq_len), dtype=torch.int32, device=q.device)
+            out = weights.calculate.apply(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=seq_len,
+                max_seqlen_kv=seq_len,
+                causal=False,
+            )
         return weights.to_out.apply(out.to(GET_DTYPE()))
 
     @staticmethod
@@ -62,7 +88,12 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
         normed = weights.norm1.apply(hidden_states)
         normed = normed * (1.0 + scale_msa.index_select(0, indices))
         normed = normed + shift_msa.index_select(0, indices)
-        hidden_states = residual + gate_msa.index_select(0, indices) * self._attention(weights.attn, normed, pre_infer_out.rotary_emb)
+        hidden_states = residual + gate_msa.index_select(0, indices) * self._attention(
+            weights.attn,
+            normed,
+            pre_infer_out.rotary_emb,
+            pre_infer_out.sp_local_video_length,
+        )
 
         residual = hidden_states
         normed = weights.norm2.apply(hidden_states)
@@ -73,6 +104,16 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
 
     def infer(self, block_weights, pre_infer_out):
         hidden_states = pre_infer_out.hidden_states
-        for block_index, block in enumerate(block_weights.blocks):
-            hidden_states = self.run_block(block_index, block, hidden_states, pre_infer_out)
+        blocks = block_weights.blocks
+        for block_index, block in enumerate(blocks):
+            if self.block_offload:
+                if self.offload_manager.need_init_first_buffer:
+                    self.offload_manager.init_first_buffer(blocks)
+                self.offload_manager.prefetch_weights((block_index + 1) % len(blocks), blocks)
+                block = self.offload_manager.cuda_buffers[0]
+                with torch_device_module.stream(self.offload_manager.compute_stream):
+                    hidden_states = self.run_block(block_index, block, hidden_states, pre_infer_out)
+                self.offload_manager.swap_blocks()
+            else:
+                hidden_states = self.run_block(block_index, block, hidden_states, pre_infer_out)
         return hidden_states

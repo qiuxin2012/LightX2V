@@ -39,7 +39,27 @@ MiniMax-H3/
 - 保存路径必须以 `.mp4` 结尾；输出为 24 fps H.264 视频和 32 kHz AAC 立体声音频。
 - 默认 attention 后端是 `torch_sdpa`。只有环境已经安装并支持 FlashAttention 3 时，才应把配置中的 `attn_type` 改为 `flash_attn3`。
 
-当前实现面向单卡，并要求按组件顺序执行 CPU offload：文本编码器 → DiT → 视频 VAE → 音频 VAE。配置中应保持 `cpu_offload`、`text_encoder_cpu_offload` 和 `vae_cpu_offload` 为 `true`，`offload_granularity` 为 `model`。
+当前实现要求按组件顺序执行 CPU offload：文本编码器 → DiT → 视频 VAE → 音频 VAE。配置中应保持 `cpu_offload`、`text_encoder_cpu_offload` 和 `vae_cpu_offload` 为 `true`。H3 支持两种 DiT offload 粒度：
+
+- `module`：整个 DiT 在去噪开始前搬到设备，结束后搬回 CPU；旧配置值 `model` 作为兼容别名保留。
+- `block`：50 个 transformer blocks 常驻 pinned CPU memory，设备上保留两个 block buffer，计算当前 block 时异步预取下一个 block。
+
+DiT 支持 Ulysses sequence parallel。H3 的 video rows 在 SP ranks 间切分，变长的 text/audio rows 在组内复制，因此不会为 packed sequence 引入会污染 softmax 的 padding token。当前只支持 `seq_p_attn_type: "ulysses"`，且 `seq_p_size` 必须整除 56 个 attention heads（例如 2、4、7、8）。两卡示例：
+
+```bash
+MODEL_PATH=/llm/models/MiniMax-H3/FL2VA \
+bash scripts/minimax_h3/run_minimax_h3_t2av_ulysses.sh
+```
+
+对应配置为 `configs/minimax_h3/minimax_h3_t2av_ulysses.json`。如需修改卡数，必须同时修改配置中的 `parallel.seq_p_size` 和脚本的 `NUM_PROCESSES`。
+
+Ulysses 加 block offload 使用：
+
+```bash
+CONFIG_JSON=configs/minimax_h3/minimax_h3_t2av_ulysses_block_offload.json \
+MODEL_PATH=/llm/models/MiniMax-H3/FL2VA \
+bash scripts/minimax_h3/run_minimax_h3_t2av_ulysses.sh
+```
 
 ## CLI
 
@@ -113,7 +133,7 @@ ref_pipe.generate(
 ## 当前未支持
 
 - CFG、negative prompt 条件分支和 CFG parallel
-- sequence parallel、tensor parallel 及多卡推理
+- tensor parallel、Ring sequence parallel，以及 Ulysses 与 TP/CFG parallel 的组合
 - DiT 量化、LoRA 和 feature caching
-- block offload、`lazy_load`、`unload_modules` 和 warmup
+- `lazy_load`、`unload_modules` 和 warmup
 - 转换后的 checkpoint 或非官方 safetensors 权重格式

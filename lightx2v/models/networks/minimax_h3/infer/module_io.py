@@ -13,6 +13,12 @@ class MiniMaxH3PreInferOutput:
     video_indices: torch.Tensor
     audio_indices: torch.Tensor
     text_indices: torch.Tensor
+    # In sequence-parallel mode hidden_states is laid out as
+    # [local sharded video rows | replicated auxiliary rows].  The auxiliary
+    # rows contain every non-video token plus the (at most sp_size - 1) video
+    # rows needed to make the sharded prefix evenly divisible.
+    sp_local_video_length: int = 0
+    sp_video_tail_length: int = 0
 
 
 @dataclass

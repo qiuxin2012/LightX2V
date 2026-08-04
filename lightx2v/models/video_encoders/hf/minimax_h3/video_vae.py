@@ -59,11 +59,13 @@ def _empty_device_cache(device: torch.device) -> None:
 
 def _component_dir(model_path: str | Path, component: str) -> Path:
     model_path = Path(model_path)
-    nested = model_path / component
-    if nested.is_dir():
-        return nested
-    if model_path.name == component and model_path.is_dir():
-        return model_path
+    names = (component, "video_vae") if component == "vae" else (component,)
+    for name in names:
+        nested = model_path / name
+        if nested.is_dir():
+            return nested
+        if model_path.name == name and model_path.is_dir():
+            return model_path
     raise FileNotFoundError(f"Cannot find MiniMax-H3 {component!r} below {model_path}")
 
 
@@ -508,13 +510,38 @@ class MiniMaxH3VideoVAE(nn.Module):
         vae_dir = _component_dir(model_path, "vae")
         with (vae_dir / "config.json").open("r", encoding="utf-8") as handle:
             config = json.load(handle)
+        weights_dir = vae_dir
+        source_path = config.get("source_path")
+        if source_path and (vae_dir / source_path).is_dir():
+            weights_dir = vae_dir / source_path
+            with (weights_dir / "config.json").open("r", encoding="utf-8") as handle:
+                source_config = json.load(handle)
+            vit_config = source_config.get("vit_decoder_kwargs", {})
+            config.update(
+                {
+                    "latent_channels": source_config.get("z_channels", config.get("latent_channels", 24)),
+                    "out_channels": source_config.get("out_ch", 3),
+                    "block_out_channels": [source_config.get("ch", 128) * value for value in source_config.get("ch_mult", (1, 2, 2, 4, 4, 8))],
+                    "layers_per_block": source_config.get("num_res_blocks", 2),
+                    "spatial_downsample_factors": source_config.get("space_down", (2, 2, 2, 2, 1, 1)),
+                    "temporal_downsample_factors": source_config.get("time_down", (1, 2, 2, 1, 1, 1)),
+                    "spatial_padding_mode": source_config.get("padding_mode", "reflect"),
+                    "decoder_num_layers": vit_config.get("num_layers", 36),
+                    "decoder_num_attention_heads": vit_config.get("heads", 32),
+                    "decoder_attention_head_dim": vit_config.get("dim_head", 64),
+                    "decoder_rope_theta": vit_config.get("rope_theta", 100.0),
+                    "decoder_rope_dim_ratio": vit_config.get("rope_dim_ratio", 0.75),
+                    "clip_length": config.get("vae_clip_length", 17),
+                    "token_drop": config.get("vae_token_drop", 3),
+                }
+            )
 
         # The released decoder is several GiB.  Constructing it on meta avoids
         # allocating and then immediately overwriting random initialized weights.
         with torch.device("meta"):
             model = cls(config, device=device, cpu_offload=cpu_offload)
         model._reset_runtime_buffers()
-        model.load_report = load_safetensors_subset(model, vae_dir)
+        model.load_report = load_safetensors_subset(model, weights_dir)
         model.eval().requires_grad_(False)
         if not cpu_offload:
             model.to(model.execution_device)

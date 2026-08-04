@@ -23,6 +23,7 @@ parameters/buffers present in the target module, one tensor at a time.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -87,6 +88,25 @@ def _expected_specs(module: nn.Module) -> dict[str, tuple[tuple[int, ...], torch
     return {key: (tuple(value.shape), value.dtype) for key, value in module.state_dict().items()}
 
 
+def _checkpoint_targets(key: str) -> tuple[str, ...]:
+    """Return native names for an official (occasionally fused) VAE tensor."""
+    if key == "decoder.mask_token":
+        # The native decoder constructs the always-zero class token at runtime.
+        return ()
+    key = key.replace("decoder.x_embedder.", "decoder.proj_in.")
+    key = key.replace(".attn.to_out.", ".attn.to_out.0.")
+    key = key.replace(".ff.w1.", ".ff.net.0.proj.")
+    key = key.replace(".ff.w2.", ".ff.net.2.")
+    key = re.sub(r"^encoder\.down\.(\d+)\.block\.(\d+)\.", r"encoder.down_blocks.\1.resnets.\2.", key)
+    key = re.sub(r"^encoder\.down\.(\d+)\.downsample\.", r"encoder.down_blocks.\1.downsamplers.0.", key)
+    key = key.replace(".nin_shortcut.", ".conv_shortcut.")
+    marker = ".attn.to_qkv."
+    if marker in key:
+        prefix, suffix = key.split(marker, 1)
+        return tuple(f"{prefix}.attn.to_{name}.{suffix}" for name in ("q", "k", "v"))
+    return (key,)
+
+
 def validate_safetensors_subset(module: nn.Module, component_dir: str | Path) -> SafetensorsSubsetReport:
     """Validate exact key and shape parity without materializing checkpoint tensors."""
 
@@ -100,23 +120,32 @@ def validate_safetensors_subset(module: nn.Module, component_dir: str | Path) ->
     for filename in files:
         with safe_open(filename, framework="pt", device="cpu") as checkpoint:
             for key in checkpoint.keys():
-                if key not in expected:
-                    if key.partition(".")[0] in expected_roots:
-                        unexpected.append(key)
-                    else:
-                        ignored += 1
+                targets = _checkpoint_targets(key)
+                if not targets:
+                    ignored += 1
                     continue
                 tensor_slice = checkpoint.get_slice(key)
                 shape = tuple(tensor_slice.get_shape())
-                expected_shape, expected_dtype = expected[key]
-                if shape != expected_shape:
-                    raise ValueError(f"Shape mismatch for {key!r}: model expects {expected_shape}, checkpoint contains {shape}")
                 checkpoint_dtype = str(tensor_slice.get_dtype())
-                if checkpoint_dtype != _SAFETENSORS_DTYPES.get(expected_dtype):
-                    raise TypeError(f"Dtype mismatch for {key!r}: model expects {expected_dtype}, checkpoint contains {checkpoint_dtype}")
-                if key in found:
-                    unexpected.append(f"duplicate:{key}")
-                found.add(key)
+                if len(targets) == 3:
+                    if not shape or shape[0] % 3:
+                        raise ValueError(f"Invalid fused QKV shape for {key!r}: {shape}")
+                    shape = (shape[0] // 3, *shape[1:])
+                for target in targets:
+                    if target not in expected:
+                        if target.partition(".")[0] in expected_roots:
+                            unexpected.append(key)
+                        else:
+                            ignored += 1
+                        continue
+                    expected_shape, expected_dtype = expected[target]
+                    if shape != expected_shape:
+                        raise ValueError(f"Shape mismatch for {target!r}: model expects {expected_shape}, checkpoint contains {shape}")
+                    if checkpoint_dtype != _SAFETENSORS_DTYPES.get(expected_dtype):
+                        raise TypeError(f"Dtype mismatch for {target!r}: model expects {expected_dtype}, checkpoint contains {checkpoint_dtype}")
+                    if target in found:
+                        unexpected.append(f"duplicate:{target}")
+                    found.add(target)
 
     missing = sorted(set(expected) - found)
     if missing or unexpected:
@@ -145,10 +174,14 @@ def load_safetensors_subset(module: nn.Module, component_dir: str | Path) -> Saf
     for filename in report.files:
         with safe_open(filename, framework="pt", device="cpu") as checkpoint:
             for key in checkpoint.keys():
-                if key not in expected:
+                targets = tuple(target for target in _checkpoint_targets(key) if target in expected)
+                if not targets:
                     continue
-                _assign_tensor(module, key, checkpoint.get_tensor(key))
-                loaded.add(key)
+                tensor = checkpoint.get_tensor(key)
+                tensors = tensor.chunk(3, dim=0) if len(targets) == 3 else (tensor,)
+                for target, value in zip(targets, tensors):
+                    _assign_tensor(module, target, value)
+                    loaded.add(target)
 
     # validate_safetensors_subset already checked this, but keep the invariant
     # local to the mutating operation as well.

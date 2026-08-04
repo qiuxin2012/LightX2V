@@ -65,8 +65,11 @@ class MiniMaxH3Runner(DefaultRunner):
             raise ValueError("MiniMax-H3 currently requires cpu_offload=true so Qwen, DiT, and both VAEs can run sequentially without residing on one GPU together")
         if not config.get("text_encoder_cpu_offload", True) or not config.get("vae_cpu_offload", True):
             raise ValueError("MiniMax-H3 requires text_encoder_cpu_offload=true and vae_cpu_offload=true; the conditioner, DiT, and VAEs are intentionally resident on the accelerator one at a time.")
+        offload_granularity = config.get("offload_granularity", "module")
+        if offload_granularity not in {"model", "module", "block"}:
+            raise ValueError(f"MiniMax-H3 offload_granularity must be 'module' or 'block', got {offload_granularity!r}")
         if config.get("lazy_load", False) or config.get("unload_modules", False):
-            raise NotImplementedError("MiniMax-H3 does not support lazy_load or unload_modules yet; use the released sharded checkpoint with cpu_offload=true and offload_granularity='model'.")
+            raise NotImplementedError("MiniMax-H3 does not support lazy_load or unload_modules yet; use cpu_offload with module or block granularity.")
         super().__init__(config)
 
     def init_modules(self):
@@ -351,8 +354,14 @@ class MiniMaxH3Runner(DefaultRunner):
             f"text={prompt_embeds.shape[0]}, audio={self.scheduler.audio_latents.shape[0]}, "
             f"video={self.scheduler.video_latents.shape[0]}, total={self.scheduler.layout.sequence_length}"
         )
-        logger.info("Moving the native MiniMax-H3 transformer to the accelerator")
-        self.model.to_cuda()
+        if self.config.get("offload_granularity") == "block":
+            logger.info("Moving MiniMax-H3 non-block weights and two streaming block buffers to the accelerator")
+            self.model.pre_weight.to_cuda()
+            self.model.post_weight.to_cuda()
+            self.model.transformer_weights.offload_buffers_to_device()
+        else:
+            logger.info("Moving the native MiniMax-H3 transformer module to the accelerator")
+            self.model.to_cuda()
         torch_device_module.synchronize()
 
     def run_segment(self, segment_idx=0):
@@ -369,7 +378,12 @@ class MiniMaxH3Runner(DefaultRunner):
 
     def _offload_transformer(self):
         logger.info("Offloading MiniMax-H3 transformer before VAE decode")
-        self.model.to_cpu()
+        if self.config.get("offload_granularity") == "block":
+            self.model.pre_weight.to_cpu()
+            self.model.post_weight.to_cpu()
+            self.model.transformer_weights.offload_buffers_to_cpu()
+        else:
+            self.model.to_cpu()
         torch_device_module.synchronize()
         self.maybe_empty_cache(force=True, collect_garbage=True)
 
