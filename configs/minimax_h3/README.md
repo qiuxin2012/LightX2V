@@ -53,6 +53,13 @@ bash scripts/minimax_h3/run_minimax_h3_t2av_ulysses.sh
 
 脚本默认使用 block offload 配置 `configs/minimax_h3/minimax_h3_t2av_ulysses_block_offload.json`。如需修改卡数，必须同时修改配置中的 `parallel.seq_p_size` 和脚本的 `NUM_PROCESSES`。若要改用 module offload，可通过 `CONFIG_JSON=configs/minimax_h3/minimax_h3_t2av_ulysses.json` 显式指定。
 
+8 卡 TP=2 + Ulysses SP=4 + block offload 使用：
+
+```bash
+MODEL_PATH=/llm/models/MiniMax-H3/FL2VA \
+bash scripts/minimax_h3/run_minimax_h3_t2av_tp2_ulysses4.sh
+```
+
 ## CLI
 
 在 LightX2V 仓库根目录运行：

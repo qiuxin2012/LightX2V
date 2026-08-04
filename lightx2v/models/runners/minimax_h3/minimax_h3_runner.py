@@ -70,6 +70,9 @@ class MiniMaxH3Runner(DefaultRunner):
             raise ValueError(f"MiniMax-H3 offload_granularity must be 'module' or 'block', got {offload_granularity!r}")
         if config.get("lazy_load", False) or config.get("unload_modules", False):
             raise NotImplementedError("MiniMax-H3 does not support lazy_load or unload_modules yet; use cpu_offload with module or block granularity.")
+        # T2AV conditioning and final decode are identical across all TP/SP
+        # ranks. Keep their very large weights on rank 0 only.
+        self.rank0_aux_only = config.get("task") == "t2av" and dist.is_initialized() and dist.get_world_size() > 1
         super().__init__(config)
 
     def init_modules(self):
@@ -95,9 +98,13 @@ class MiniMaxH3Runner(DefaultRunner):
         )
 
     def load_text_encoder(self):
+        if self.rank0_aux_only and dist.get_rank() != 0:
+            return [None]
         return [MiniMaxH3Qwen3VLTextEncoder(self.config)]
 
     def load_vae(self):
+        if self.rank0_aux_only and dist.get_rank() != 0:
+            return None, None
         cpu_offload = self.config.get("vae_cpu_offload", self.config.get("cpu_offload", False))
         video_vae = MiniMaxH3VideoVAE.from_pretrained(self.config["model_path"], device=AI_DEVICE, cpu_offload=cpu_offload)
         audio_vae = MiniMaxH3AudioVAE.from_pretrained(self.config["model_path"], device=AI_DEVICE, cpu_offload=cpu_offload)
@@ -133,7 +140,28 @@ class MiniMaxH3Runner(DefaultRunner):
         negative_prompt = (input_info.negative_prompt or "").strip()
         if negative_prompt:
             logger.warning("MiniMax-H3 is guidance-distilled; negative_prompt is ignored")
-        return self.text_encoders[0].infer(input_info.prompt, image_list=keyframes, references=references)
+        if not self.rank0_aux_only:
+            return self.text_encoders[0].infer(input_info.prompt, image_list=keyframes, references=references)
+
+        output = self.text_encoders[0].infer(input_info.prompt, image_list=keyframes, references=references) if dist.get_rank() == 0 else None
+        metadata = [None]
+        if dist.get_rank() == 0:
+            metadata[0] = {
+                "prompt_shape": tuple(output["prompt_embeds"].shape),
+                "prompt_dtype": output["prompt_embeds"].dtype,
+                "tags_shape": tuple(output["text_token_tags"].shape),
+                "tags_dtype": output["text_token_tags"].dtype,
+            }
+        dist.broadcast_object_list(metadata, src=0)
+        meta = metadata[0]
+        if dist.get_rank() != 0:
+            output = {
+                "prompt_embeds": torch.empty(meta["prompt_shape"], dtype=meta["prompt_dtype"], device=AI_DEVICE),
+                "text_token_tags": torch.empty(meta["tags_shape"], dtype=meta["tags_dtype"], device=AI_DEVICE),
+            }
+        dist.broadcast(output["prompt_embeds"], src=0)
+        dist.broadcast(output["text_token_tags"], src=0)
+        return output
 
     @staticmethod
     def _load_rgb_image(value):
@@ -452,8 +480,14 @@ class MiniMaxH3Runner(DefaultRunner):
                 self._offload_transformer()
                 transformer_offloaded = True
 
-            self.gen_video, self.gen_audio = self.run_vae_decoder(video_rows, audio_rows)
-            return self.process_images_after_vae_decoder()
+            if not self.rank0_aux_only or dist.get_rank() == 0:
+                self.gen_video, self.gen_audio = self.run_vae_decoder(video_rows, audio_rows)
+                result = self.process_images_after_vae_decoder()
+            else:
+                result = {"video": None, "audio": None}
+            if self.rank0_aux_only:
+                dist.barrier()
+            return result
         finally:
             # ``init_run`` can fail after a partial device transfer. Preserve
             # the original exception while still making a best-effort return

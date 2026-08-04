@@ -1,4 +1,5 @@
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from lightx2v.common.offload.manager import WeightAsyncStreamManager
@@ -25,7 +26,12 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
     def __init__(self, config):
         self.config = config
         self.hidden_size = int(config.get("hidden_size", 5376))
-        self.num_heads = int(config.get("num_attention_heads", 56))
+        self.tp_group = config.get("device_mesh").get_group(mesh_dim="tensor_p") if config.get("tensor_parallel", False) else None
+        self.tp_size = dist.get_world_size(self.tp_group) if self.tp_group is not None else 1
+        global_num_heads = int(config.get("num_attention_heads", 56))
+        if global_num_heads % self.tp_size:
+            raise ValueError(f"MiniMax-H3 attention heads {global_num_heads} are not divisible by TP size {self.tp_size}")
+        self.num_heads = global_num_heads // self.tp_size
         self.head_dim = int(config.get("attention_head_dim", 128))
         self.seq_parallel = config.get("seq_parallel", False)
         self.seq_p_group = config.get("device_mesh").get_group(mesh_dim="seq_p") if self.seq_parallel else None
@@ -69,17 +75,26 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
                 max_seqlen_kv=seq_len,
                 causal=False,
             )
-        return weights.to_out.apply(out.to(GET_DTYPE()))
+        out = weights.to_out.apply(out.to(GET_DTYPE()))
+        if self.tp_group is not None:
+            dist.all_reduce(out, op=dist.ReduceOp.SUM, group=self.tp_group)
+        return out
 
-    @staticmethod
-    def _ff(weights, hidden_states):
+    def _ff(self, weights, hidden_states):
         value, gate = weights.in_proj.apply(hidden_states).chunk(2, dim=-1)
-        return weights.out_proj.apply(value * F.silu(gate))
+        out = weights.out_proj.apply(value * F.silu(gate))
+        if self.tp_group is not None:
+            dist.all_reduce(out, op=dist.ReduceOp.SUM, group=self.tp_group)
+        return out
 
     def infer_block(self, weights, hidden_states, pre_infer_out):
         # Activation is evaluated in fp32, then cast immediately before the
         # checkpoint's bf16 AdaLN projection.
         modulation = weights.adaln.apply(F.silu(pre_infer_out.temb).to(GET_DTYPE()))
+        if self.tp_group is not None:
+            gathered_modulation = [torch.empty_like(modulation) for _ in range(self.tp_size)]
+            dist.all_gather(gathered_modulation, modulation, group=self.tp_group)
+            modulation = torch.cat(gathered_modulation, dim=-1)
         modulation = modulation.view(-1, 6 * self.hidden_size)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulation.chunk(6, dim=-1)
         indices = pre_infer_out.adaln_indices

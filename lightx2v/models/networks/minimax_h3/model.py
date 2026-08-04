@@ -28,13 +28,17 @@ class MiniMaxH3Model(BaseTransformerModel):
             raise ValueError(
                 "MiniMax-H3 requires DTYPE=BF16. The native loader preserves the released checkpoint's 626 BF16 tensors and 12 FP32 projection/time/head tensors without dtype conversion."
             )
-        if config.get("seq_parallel", False):
-            sp_size = int(config.get("parallel", {}).get("seq_p_size", 1))
-            num_heads = int(config.get("num_attention_heads", 56))
-            if num_heads % sp_size:
-                raise ValueError(f"MiniMax-H3 Ulysses requires seq_p_size to divide {num_heads} attention heads, got {sp_size}")
-        if config.get("tensor_parallel", False):
-            raise NotImplementedError("MiniMax-H3 tensor parallel support is not implemented yet")
+        parallel = config.get("parallel", {})
+        tp_size = int(parallel.get("tensor_p_size", 1))
+        sp_size = int(parallel.get("seq_p_size", 1))
+        num_heads = int(config.get("num_attention_heads", 56))
+        if num_heads % tp_size:
+            raise ValueError(f"MiniMax-H3 tensor_p_size must divide {num_heads} attention heads, got {tp_size}")
+        if config.get("seq_parallel", False) and (num_heads // tp_size) % sp_size:
+            raise ValueError(
+                "MiniMax-H3 Ulysses requires seq_p_size to divide TP-local attention heads: "
+                f"global_heads={num_heads}, tensor_p_size={tp_size}, local_heads={num_heads // tp_size}, seq_p_size={sp_size}"
+            )
         if config.get("cfg_parallel", False) or config.get("enable_cfg", False):
             raise ValueError("MiniMax-H3 is guidance-distilled and does not have a CFG/unconditional branch")
         if config.get("dit_quantized", False):
@@ -94,8 +98,33 @@ class MiniMaxH3Model(BaseTransformerModel):
             )
         return weights
 
-    @staticmethod
-    def _convert_released_weight(destination, key, tensor):
+    def _store_converted_weight(self, destination, key, tensor):
+        """Store only this rank's TP shard while streaming the checkpoint."""
+        if not self.use_tp or not key.startswith("transformer_blocks."):
+            destination[key] = tensor
+            return
+
+        column_parallel = (".attn.to_q.", ".attn.to_k.", ".attn.to_v.", ".adaln_proj.linear.")
+        row_parallel = (".attn.to_out.0.", ".ff.net.2.")
+        if any(marker in key for marker in column_parallel):
+            if tensor.shape[0] % self.tp_size:
+                raise ValueError(f"Cannot column-shard {key} with shape {tuple(tensor.shape)} over TP={self.tp_size}")
+            tensor = torch.chunk(tensor, self.tp_size, dim=0)[self.tp_rank].contiguous()
+        elif ".ff.net.0.proj." in key:
+            if tensor.shape[0] % (2 * self.tp_size):
+                raise ValueError(f"Cannot shard fused value/gate tensor {key} with shape {tuple(tensor.shape)} over TP={self.tp_size}")
+            value, gate = tensor.chunk(2, dim=0)
+            tensor = torch.cat(
+                (torch.chunk(value, self.tp_size, dim=0)[self.tp_rank], torch.chunk(gate, self.tp_size, dim=0)[self.tp_rank]),
+                dim=0,
+            ).contiguous()
+        elif any(marker in key for marker in row_parallel):
+            if tensor.shape[1] % self.tp_size:
+                raise ValueError(f"Cannot row-shard {key} with shape {tuple(tensor.shape)} over TP={self.tp_size}")
+            tensor = torch.chunk(tensor, self.tp_size, dim=1)[self.tp_rank].contiguous()
+        destination[key] = tensor
+
+    def _convert_released_weight(self, destination, key, tensor):
         """Map the official fused H3 checkpoint to the native weight layout."""
         direct_names = {
             "video_patch_proj": "proj_in",
@@ -110,7 +139,7 @@ class MiniMaxH3Model(BaseTransformerModel):
         }
         for source_name, target_name in direct_names.items():
             if key == source_name or key.startswith(source_name + "."):
-                destination[target_name + key[len(source_name) :]] = tensor
+                self._store_converted_weight(destination, target_name + key[len(source_name) :], tensor)
                 return
 
         if key == "rope.inv_freq":
@@ -138,12 +167,22 @@ class MiniMaxH3Model(BaseTransformerModel):
                 raise ValueError(f"MiniMax-H3 fused QKV tensor has invalid shape: {key}={tuple(tensor.shape)}")
             prefix, suffix = key.split(qkv_marker, 1)
             q, k, v = tensor.chunk(3, dim=0)
-            destination[f"{prefix}.attn.to_q.{suffix}"] = q
-            destination[f"{prefix}.attn.to_k.{suffix}"] = k
-            destination[f"{prefix}.attn.to_v.{suffix}"] = v
+            self._store_converted_weight(destination, f"{prefix}.attn.to_q.{suffix}", q)
+            self._store_converted_weight(destination, f"{prefix}.attn.to_k.{suffix}", k)
+            self._store_converted_weight(destination, f"{prefix}.attn.to_v.{suffix}", v)
             return
 
-        destination[key] = tensor
+        self._store_converted_weight(destination, key, tensor)
+
+    def _should_load_weights(self):
+        # Every rank streams the official shards and immediately retains only
+        # its TP-local tensors. This avoids materializing a full 62 GiB model
+        # on rank 0 and works for CPU/block offload without device staging.
+        return True
+
+    def _load_weights_from_rank0(self, weight_dict, is_weight_loader):
+        del is_weight_loader
+        return weight_dict
 
     def _init_infer_class(self):
         if self.config.get("feature_caching", "NoCaching") != "NoCaching":
