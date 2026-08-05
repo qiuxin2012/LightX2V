@@ -104,56 +104,34 @@ class WanModel(BaseTransformerModel):
             raise ValueError(f"Cannot split {key} shape {tuple(weight.shape)} across tensor parallel size {tp_size} on dimension {split_dim}")
         return list(torch.chunk(weight, tp_size, dim=split_dim))
 
+    def _should_load_weights(self):
+        if self.use_tp and dist.is_initialized():
+            # XPU oneCCL can segfault while broadcasting large checkpoint
+            # tensors.  Let every rank stream the checkpoint and retain only
+            # its local TP shard instead.
+            return True
+        return super()._should_load_weights()
+
     def _load_weights_from_rank0(self, weight_dict, is_weight_loader):
         if not self.use_tp:
             return super()._load_weights_from_rank0(weight_dict, is_weight_loader)
+        if not is_weight_loader:
+            raise RuntimeError("Wan tensor parallel local sharding requires every rank to load the checkpoint")
 
-        src_rank = 0
-        target_device = self._rank_device()
-
-        if is_weight_loader:
-            processed, meta, processed_bias = {}, {}, set()
-            for key, tensor in weight_dict.items():
+        local_weights = {}
+        for key, tensor in weight_dict.items():
+            if key.endswith(".weight"):
                 split_type = self._get_split_type(key)
-                if key.endswith(".weight") and split_type is not None:
-                    shards = self._split_weight_for_tp(key, tensor, self.tp_size)
-                    for r, shard in enumerate(shards):
-                        processed[f"{key}__tp_{r}"] = shard.contiguous()
-                    meta[key] = {"shape": shards[0].shape, "dtype": shards[0].dtype, "is_tp": True}
-                    bias_key = key.replace(".weight", ".bias")
-                    if bias_key in weight_dict and split_type == "col":
-                        bias_shards = self._split_bias_for_tp(weight_dict[bias_key], split_type, self.tp_size)
-                        for r, shard in enumerate(bias_shards):
-                            processed[f"{bias_key}__tp_{r}"] = shard.contiguous()
-                        meta[bias_key] = {"shape": bias_shards[0].shape, "dtype": bias_shards[0].dtype, "is_tp": True}
-                        processed_bias.add(bias_key)
-                elif key not in processed_bias:
-                    processed[key] = tensor
-                    meta[key] = {"shape": tensor.shape, "dtype": tensor.dtype, "is_tp": False}
-            obj_list = [meta]
-        else:
-            obj_list = [None]
-
-        dist.broadcast_object_list(obj_list, src=src_rank)
-        synced_meta = obj_list[0]
-
-        distributed = {k: torch.empty(m["shape"], dtype=m["dtype"], device=target_device) for k, m in synced_meta.items()}
-
-        for key in sorted(synced_meta.keys()):
-            m = synced_meta[key]
-            if m["is_tp"]:
-                for r in range(self.tp_size):
-                    buf = processed[f"{key}__tp_{r}"].to(target_device) if is_weight_loader else torch.empty(m["shape"], dtype=m["dtype"], device=target_device)
-                    dist.broadcast(buf, src=src_rank, group=self.tp_group)
-                    if r == self.tp_rank:
-                        distributed[key].copy_(buf)
-                    del buf
-            else:
-                if is_weight_loader:
-                    distributed[key].copy_(processed[key].to(target_device))
-                dist.broadcast(distributed[key], src=src_rank, group=self.tp_group)
-
-        return distributed
+                if split_type is not None:
+                    local_weights[key] = self._split_weight_for_tp(key, tensor, self.tp_size)[self.tp_rank].contiguous()
+                    continue
+            if key.endswith(".bias"):
+                weight_key = key.removesuffix(".bias") + ".weight"
+                if weight_key in weight_dict and self._get_split_type(weight_key) == "col":
+                    local_weights[key] = self._split_bias_for_tp(tensor, "col", self.tp_size)[self.tp_rank].contiguous()
+                    continue
+            local_weights[key] = tensor
+        return local_weights
 
     # ------------------------------------------------------------------ TP --
 

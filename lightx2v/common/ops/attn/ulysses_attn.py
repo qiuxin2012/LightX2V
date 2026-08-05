@@ -1,7 +1,9 @@
+import os
 from functools import partial
 
 import torch
 import torch.distributed as dist
+from loguru import logger
 
 from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER
 
@@ -18,6 +20,14 @@ class UlyssesAttnWeight(AttnWeightTemplate):
     def __init__(self, a2a_backend="torch"):
         self.config = {}
         self.default_a2a_backend = a2a_backend
+
+    @staticmethod
+    def _debug_sync(stage, tensor):
+        if os.getenv("MINIMAX_H3_DEBUG_SYNC", "0") != "1":
+            return
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        logger.info(f"[H3 debug][rank={rank}] Ulysses: {stage}; shape={tuple(tensor.shape)}, dtype={tensor.dtype}, device={tensor.device}")
+        getattr(torch, tensor.device.type).synchronize()
 
     def apply(
         self,
@@ -191,7 +201,9 @@ class UlyssesAttnWeight(AttnWeightTemplate):
         aux_len = 0 if aux_q is None else aux_q.shape[0]
 
         packed_qkv = prepost.pack_qkv(q, k, v, world_size, quant_scheme, qkv_fusion)
+        UlyssesAttnWeight._debug_sync("packed QKV", q)
         exchanged_qkv = UlyssesAttnWeight._exchange_packed(packed_qkv, a2a, seq_p_group)
+        UlyssesAttnWeight._debug_sync("exchanged QKV", exchanged_qkv[0][0])
         attn_q, attn_k, attn_v = prepost.unpack_qkv(
             exchanged_qkv,
             q,
@@ -206,19 +218,24 @@ class UlyssesAttnWeight(AttnWeightTemplate):
         )
         dense_attention_kwargs = UlyssesAttnWeight._dense_attention_kwargs(attention_kwargs, attn_q, attn_k)
 
+        UlyssesAttnWeight._debug_sync("before attention", attn_q)
         attn = attention_module.apply(
             q=attn_q,
             k=attn_k,
             v=attn_v,
             **dense_attention_kwargs,
         ).reshape(attn_q.shape[0], -1)
+        UlyssesAttnWeight._debug_sync("after attention", attn)
         output, local_aux_attn = split_main_aux_output(attn, global_len, aux_len, aux_first)
 
         packed_attn = prepost.pack_attn(output, local_len, world_size, shard_heads, hidden_dims, quant_scheme)
+        UlyssesAttnWeight._debug_sync("packed attention output", output)
         exchanged_attn = UlyssesAttnWeight._exchange_packed(packed_attn, a2a, seq_p_group)
+        UlyssesAttnWeight._debug_sync("exchanged attention output", exchanged_attn[0][0])
         output = prepost.unpack_attn(exchanged_attn, attn.dtype, hidden_dims)
 
         aux_output = UlyssesAttnWeight._gather_aux(local_aux_attn, world_size, seq_p_group)
+        UlyssesAttnWeight._debug_sync("gathered auxiliary output", output if aux_output is None else aux_output)
         return output, aux_output
 
     @staticmethod

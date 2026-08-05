@@ -2534,8 +2534,50 @@ class MMWeightTP(MMWeightTemplate):
         """
         self._mm.load(weight_dict)
         if self.split_dim == "row" and self.bias_name is not None and self.bias_name in weight_dict:
-            self._row_split_bias = self._mm.bias.clone()
-            self._mm.bias = None
+            # Keep one full bias outside the wrapped MM implementation.  With
+            # CPU/phase offload the wrapped weight exposes ``pin_bias`` rather
+            # than ``bias`` at load time, so reading ``_mm.bias`` directly is
+            # not valid.  The row-parallel bias must only be added once after
+            # the TP all-reduce.
+            self._row_split_bias_host = weight_dict[self.bias_name].detach().cpu().clone()
+            self._row_split_bias = None
+            if hasattr(self._mm, "bias"):
+                self._mm.bias = None
+            if hasattr(self._mm, "pin_bias"):
+                self._mm.pin_bias = None
+            if hasattr(self._mm, "bias_cuda_buffer"):
+                self._mm.bias_cuda_buffer = None
+
+    def to_cuda(self, non_blocking=False):
+        self._mm.to_cuda(non_blocking=non_blocking)
+        if hasattr(self, "_row_split_bias_host"):
+            self._row_split_bias = self._row_split_bias_host.to(AI_DEVICE, non_blocking=non_blocking)
+
+    def to_cpu(self, non_blocking=False):
+        self._mm.to_cpu(non_blocking=non_blocking)
+        self._row_split_bias = None
+
+    def state_dict(self, destination=None):
+        destination = self._mm.state_dict(destination)
+        if hasattr(self, "_row_split_bias_host"):
+            destination[self.bias_name] = self._row_split_bias_host
+        return destination
+
+    def load_state_dict(self, destination, block_index, adapter_block_index=None):
+        if self.split_dim != "row" or self.bias_name is None:
+            return self._mm.load_state_dict(destination, block_index, adapter_block_index)
+
+        actual_bias_name = resolve_block_name(self.bias_name, block_index, adapter_block_index, self.is_post_adapter)
+        weight_destination = destination
+        if actual_bias_name in destination:
+            # Do not load row bias into the wrapped GEMM; it is applied once
+            # after the all-reduce below.
+            weight_destination = dict(destination)
+            row_bias = weight_destination.pop(actual_bias_name)
+            self._row_split_bias = row_bias.to(AI_DEVICE, non_blocking=True)
+        else:
+            self._row_split_bias = None
+        return self._mm.load_state_dict(weight_destination, block_index, adapter_block_index)
 
     def apply(self, input_tensor):
         """Apply matrix multiplication with tensor parallel support."""
@@ -2547,6 +2589,8 @@ class MMWeightTP(MMWeightTemplate):
         if self.split_dim == "row" and self.reduce_output and self.tp_size > 1 and self.tp_group is not None:
             dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.tp_group)
             # Add bias after all-reduce (bias is not split for row split)
+            if self._row_split_bias is None and hasattr(self, "_row_split_bias_host"):
+                self._row_split_bias = self._row_split_bias_host.to(output.device)
             if self._row_split_bias is not None:
                 output = output + self._row_split_bias
 

@@ -71,8 +71,11 @@ class MiniMaxH3Runner(DefaultRunner):
         if config.get("lazy_load", False) or config.get("unload_modules", False):
             raise NotImplementedError("MiniMax-H3 does not support lazy_load or unload_modules yet; use cpu_offload with module or block granularity.")
         # T2AV conditioning and final decode are identical across all TP/SP
-        # ranks. Keep their very large weights on rank 0 only.
+        # ranks. Keep their very large weights on one configurable rank only.
         self.rank0_aux_only = config.get("task") == "t2av" and dist.is_initialized() and dist.get_world_size() > 1
+        self.aux_rank = int(config.get("aux_rank", 0))
+        if self.rank0_aux_only and not 0 <= self.aux_rank < dist.get_world_size():
+            raise ValueError(f"MiniMax-H3 aux_rank must be in [0, {dist.get_world_size()}), got {self.aux_rank}")
         super().__init__(config)
 
     def init_modules(self):
@@ -98,12 +101,12 @@ class MiniMaxH3Runner(DefaultRunner):
         )
 
     def load_text_encoder(self):
-        if self.rank0_aux_only and dist.get_rank() != 0:
+        if self.rank0_aux_only and dist.get_rank() != self.aux_rank:
             return [None]
         return [MiniMaxH3Qwen3VLTextEncoder(self.config)]
 
     def load_vae(self):
-        if self.rank0_aux_only and dist.get_rank() != 0:
+        if self.rank0_aux_only and dist.get_rank() != self.aux_rank:
             return None, None
         cpu_offload = self.config.get("vae_cpu_offload", self.config.get("cpu_offload", False))
         video_vae = MiniMaxH3VideoVAE.from_pretrained(self.config["model_path"], device=AI_DEVICE, cpu_offload=cpu_offload)
@@ -143,24 +146,24 @@ class MiniMaxH3Runner(DefaultRunner):
         if not self.rank0_aux_only:
             return self.text_encoders[0].infer(input_info.prompt, image_list=keyframes, references=references)
 
-        output = self.text_encoders[0].infer(input_info.prompt, image_list=keyframes, references=references) if dist.get_rank() == 0 else None
+        output = self.text_encoders[0].infer(input_info.prompt, image_list=keyframes, references=references) if dist.get_rank() == self.aux_rank else None
         metadata = [None]
-        if dist.get_rank() == 0:
+        if dist.get_rank() == self.aux_rank:
             metadata[0] = {
                 "prompt_shape": tuple(output["prompt_embeds"].shape),
                 "prompt_dtype": output["prompt_embeds"].dtype,
                 "tags_shape": tuple(output["text_token_tags"].shape),
                 "tags_dtype": output["text_token_tags"].dtype,
             }
-        dist.broadcast_object_list(metadata, src=0)
+        dist.broadcast_object_list(metadata, src=self.aux_rank)
         meta = metadata[0]
-        if dist.get_rank() != 0:
+        if dist.get_rank() != self.aux_rank:
             output = {
                 "prompt_embeds": torch.empty(meta["prompt_shape"], dtype=meta["prompt_dtype"], device=AI_DEVICE),
                 "text_token_tags": torch.empty(meta["tags_shape"], dtype=meta["tags_dtype"], device=AI_DEVICE),
             }
-        dist.broadcast(output["prompt_embeds"], src=0)
-        dist.broadcast(output["text_token_tags"], src=0)
+        dist.broadcast(output["prompt_embeds"], src=self.aux_rank)
+        dist.broadcast(output["text_token_tags"], src=self.aux_rank)
         return output
 
     @staticmethod
@@ -448,7 +451,7 @@ class MiniMaxH3Runner(DefaultRunner):
             }
 
         output_path = self.input_info.save_result_path
-        if output_path and (not dist.is_initialized() or dist.get_rank() == 0):
+        if output_path and (not dist.is_initialized() or dist.get_rank() == self.aux_rank):
             if os.path.splitext(output_path)[1].lower() != ".mp4":
                 raise ValueError(f"MiniMax-H3 AV output uses H.264/AAC; save_result_path must end in .mp4, got {output_path!r}")
             parent = os.path.dirname(os.path.abspath(output_path))
@@ -480,7 +483,7 @@ class MiniMaxH3Runner(DefaultRunner):
                 self._offload_transformer()
                 transformer_offloaded = True
 
-            if not self.rank0_aux_only or dist.get_rank() == 0:
+            if not self.rank0_aux_only or dist.get_rank() == self.aux_rank:
                 self.gen_video, self.gen_audio = self.run_vae_decoder(video_rows, audio_rows)
                 result = self.process_images_after_vae_decoder()
             else:

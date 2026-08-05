@@ -18,24 +18,29 @@ import torch.nn.functional as F
 from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER
 from lightx2v_platform.ops.attn.template import AttnWeightTemplate
 
+_sdp_backend = None
 try:
     import sycl_kernels as _sycl_mod
 
     _sdp_fn = _sycl_mod.sdp
+    _sdp_backend = "sycl_kernels"
 except ImportError:
+    try:
+        from omni_xpu_kernel import sdp as _omni_sdp
+
+        _sdp_fn = _omni_sdp.sdp
+        _sdp_backend = "omni_xpu_kernel"
+    except ImportError:
+        _sdp_fn = None
+
+if _sdp_fn is None:
     warnings.warn(
         "\n"
-        "[intel_xpu_flash_attn] sycl_kernels not found — falling back to torch SDPA.\n"
-        "  For best performance on Intel Arc GPU, build and install the ESIMD kernel:\n"
-        "    cd lightx2v_kernel_xpu\n"
-        "    conda activate lightx2v_kernel\n"
-        "    call build_la.bat\n"
-        "    pip install dist\\sycl_kernels-0.0.1-cp311-abi3-win_amd64.whl "
-        "--force-reinstall --no-deps\n",
+        "[intel_xpu_flash_attn] no XPU SDP extension found — falling back to torch SDPA.\n"
+        "  Install omni-xpu-kernel or sycl_kernels for the native ESIMD kernel.\n",
         stacklevel=2,
     )
     _sycl_mod = None
-    _sdp_fn = None
 
 
 def _sdp(q4d, k4d, v4d):
@@ -47,7 +52,7 @@ def _sdp(q4d, k4d, v4d):
                                 (requires layout permute: [B,L,H,D] ↔ [B,H,L,D])
     """
     if _sdp_fn is not None:
-        return _sdp_fn(q4d, k4d, v4d)
+        return _sdp_fn(q4d.contiguous(), k4d.contiguous(), v4d.contiguous())
 
     # torch SDPA expects [B, H, L, D]
     q_t = q4d.permute(0, 2, 1, 3).contiguous()

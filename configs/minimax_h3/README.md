@@ -60,6 +60,16 @@ MODEL_PATH=/llm/models/MiniMax-H3/FL2VA \
 bash scripts/minimax_h3/run_minimax_h3_t2av_tp2_ulysses4.sh
 ```
 
+4 卡 TP=2 + Ulysses SP=2 + block offload 使用：
+
+```bash
+MODEL_PATH=/llm/models/MiniMax-H3/FL2VA \
+bash scripts/minimax_h3/run_minimax_h3_t2av_tp2_ulysses2.sh
+```
+
+该配置面向 Intel XPU：使用 pairwise round-robin Ulysses 通信，并通过
+`omni-xpu-kernel` 或 `sycl_kernels` 执行原生 XPU Flash Attention。
+
 ## CLI
 
 在 LightX2V 仓库根目录运行：

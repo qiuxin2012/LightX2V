@@ -80,6 +80,11 @@ def _empty_device_cache():
     """Release cached accelerator allocations without assuming CUDA."""
     with suppress(Exception):
         device_module = getattr(torch, torch.device(AI_DEVICE).type)
+        # Layerwise offload swaps each module's active weight references back
+        # to pinned CPU tensors immediately after its forward call.  XPU work
+        # is asynchronous, so synchronize before releasing those accelerator
+        # allocations; otherwise a later kernel can observe recycled storage.
+        device_module.synchronize()
         device_module.empty_cache()
 
 

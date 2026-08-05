@@ -55,7 +55,20 @@ class IntelXpuDevice:
     def init_parallel_env():
         """Initialize a single-node distributed environment for Intel XPU."""
         local_rank = int(os.environ["LOCAL_RANK"])
-        torch.xpu.set_device(local_rank)
+        device_map_value = os.environ.get("LIGHTX2V_XPU_DEVICE_MAP", "").strip()
+        if device_map_value:
+            device_map = [int(value.strip()) for value in device_map_value.split(",")]
+            world_size = int(os.environ.get("LOCAL_WORLD_SIZE", os.environ.get("WORLD_SIZE", len(device_map))))
+            if len(device_map) != world_size or sorted(device_map) != list(range(world_size)):
+                raise ValueError(
+                    "LIGHTX2V_XPU_DEVICE_MAP must be a permutation containing one device "
+                    f"per local rank; expected 0..{world_size - 1}, got {device_map}"
+                )
+            device_index = device_map[local_rank]
+            logger.info(f"Mapping local rank {local_rank} to physical xpu:{device_index}")
+        else:
+            device_index = local_rank
+        torch.xpu.set_device(device_index)
         dist.init_process_group(backend="xccl")
 
 
