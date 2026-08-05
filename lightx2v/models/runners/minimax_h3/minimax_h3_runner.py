@@ -93,6 +93,9 @@ class MiniMaxH3Runner(DefaultRunner):
         )
 
     def load_text_encoder(self):
+        if self.config.get("text_encoder_rank0_only", False) and dist.is_initialized() and dist.get_rank() != 0:
+            logger.info("Skipping duplicate MiniMax-H3 text encoder on non-zero rank; rank0 will broadcast prompt embeddings")
+            return [None]
         return [MiniMaxH3Qwen3VLTextEncoder(self.config)]
 
     def load_vae(self):
@@ -137,7 +140,45 @@ class MiniMaxH3Runner(DefaultRunner):
         negative_prompt = (input_info.negative_prompt or "").strip()
         if negative_prompt:
             logger.warning("MiniMax-H3 is guidance-distilled; negative_prompt is ignored")
-        return self.text_encoders[0].infer(input_info.prompt, image_list=keyframes, references=references)
+        rank0_only = self.config.get("text_encoder_rank0_only", False) and dist.is_initialized()
+        if not rank0_only or dist.get_rank() == 0:
+            result = self.text_encoders[0].infer(input_info.prompt, image_list=keyframes, references=references)
+        else:
+            result = None
+
+        if not rank0_only:
+            return result
+
+        if dist.get_rank() == 0:
+            prompt_embeds = result["prompt_embeds"]
+            text_token_tags = result["text_token_tags"]
+            dtype_code = {
+                torch.float32: 0,
+                torch.float16: 1,
+                torch.bfloat16: 2,
+            }.get(prompt_embeds.dtype)
+            if dtype_code is None:
+                raise TypeError(f"Unsupported MiniMax-H3 prompt embedding dtype for broadcast: {prompt_embeds.dtype}")
+            header = torch.tensor(
+                [prompt_embeds.shape[0], prompt_embeds.shape[1], dtype_code],
+                device=AI_DEVICE,
+                dtype=torch.long,
+            )
+        else:
+            header = torch.empty(3, device=AI_DEVICE, dtype=torch.long)
+        dist.broadcast(header, src=0)
+
+        num_tokens, hidden_size, dtype_code = (int(value) for value in header.tolist())
+        if dist.get_rank() != 0:
+            dtype = (torch.float32, torch.float16, torch.bfloat16)[dtype_code]
+            prompt_embeds = torch.empty((num_tokens, hidden_size), device=AI_DEVICE, dtype=dtype)
+            text_token_tags = torch.empty(num_tokens, device=AI_DEVICE, dtype=torch.long)
+        dist.broadcast(prompt_embeds, src=0)
+        dist.broadcast(text_token_tags, src=0)
+        return {
+            "prompt_embeds": prompt_embeds,
+            "text_token_tags": text_token_tags,
+        }
 
     @staticmethod
     def _load_rgb_image(value):

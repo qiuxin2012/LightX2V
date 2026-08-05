@@ -170,20 +170,38 @@ class MiniMaxH3Model(BaseTransformerModel):
         # BaseTransformerModel forces rank-0 TP loading through CPU. H3 shards
         # locally instead, so retain the runner-selected CPU/GPU target.
         if not self.use_tp:
-            return super()._load_ckpt(unified_dtype, sensitive_layer)
-        load_device = self._checkpoint_load_device()
-        logger.info(
-            "MiniMax-H3 rank {} (TP rank {}) loading TP checkpoint shards on {}",
-            dist.get_rank() if dist.is_initialized() else 0,
-            self.tp_rank,
-            load_device,
-        )
-        use_tp = self.use_tp
-        self.use_tp = False
-        try:
-            return super()._load_ckpt(unified_dtype, sensitive_layer)
-        finally:
-            self.use_tp = use_tp
+            weights = super()._load_ckpt(unified_dtype, sensitive_layer)
+        else:
+            load_device = self._checkpoint_load_device()
+            logger.info(
+                "MiniMax-H3 rank {} (TP rank {}) loading TP checkpoint shards on {}",
+                dist.get_rank() if dist.is_initialized() else 0,
+                self.tp_rank,
+                load_device,
+            )
+            use_tp = self.use_tp
+            self.use_tp = False
+            try:
+                weights = super()._load_ckpt(unified_dtype, sensitive_layer)
+            finally:
+                self.use_tp = use_tp
+
+        required = {
+            "proj_in.weight",
+            "audio_proj_in.weight",
+            "context_embedder.weight",
+            "transformer_blocks.0.attn.to_q.weight",
+            "transformer_blocks.49.attn.to_v.weight",
+            "proj_out.weight",
+            "audio_proj_out.weight",
+        }
+        missing = sorted(required.difference(weights))
+        if missing or len(weights) != 638:
+            raise ValueError(
+                "MiniMax-H3 checkpoint conversion did not produce the released 638-tensor contract: "
+                f"got {len(weights)}, missing={missing}. Check that all official transformer shards are present."
+            )
+        return weights
 
     def _load_quant_ckpt(self, unified_dtype, sensitive_layer):
         if not self.use_tp:
@@ -233,14 +251,79 @@ class MiniMaxH3Model(BaseTransformerModel):
         remove_keys = self.remove_keys if hasattr(self, "remove_keys") else []
         preserve_keys = self.preserved_keys if hasattr(self, "preserved_keys") else None
         load_device = self._checkpoint_load_device()
-        with safe_open(file_path, framework="pt", device=load_device) as source:
-            weight_dict = {
-                key: self._select_tensor_parallel_shard(key, source.get_tensor(key))
-                for key in source.keys()
-                if not any(remove_key in key for remove_key in remove_keys) and (preserve_keys is None or any(preserve_key in key for preserve_key in preserve_keys))
-            }
-        self._validate_checkpoint_devices(weight_dict, load_device)
-        return weight_dict
+        # Reading a full released tensor directly on the accelerator defeats
+        # TP's memory savings: safetensors materializes the unsharded tensor
+        # before _select_tensor_parallel_shard can retain only this rank's
+        # slice.  Read and shard on CPU, then transfer just the local shard.
+        source_device = "cpu" if self.config.get("tensor_parallel", False) and torch.device(load_device).type != "cpu" else load_device
+        converted = {}
+        with safe_open(file_path, framework="pt", device=source_device) as source:
+            for key in source.keys():
+                if any(remove_key in key for remove_key in remove_keys):
+                    continue
+                if preserve_keys is not None and not any(preserve_key in key for preserve_key in preserve_keys):
+                    continue
+                self._convert_released_weight(converted, key, source.get_tensor(key))
+        self._validate_checkpoint_devices(converted, load_device)
+        return converted
+
+    def _store_converted_weight(self, destination, key, tensor):
+        """Store a converted checkpoint tensor, selecting this rank's TP shard."""
+        tensor = self._select_tensor_parallel_shard(key, tensor)
+        load_device = torch.device(self._checkpoint_load_device())
+        if tensor.device != load_device:
+            tensor = tensor.to(load_device)
+        destination[key] = tensor
+
+    def _convert_released_weight(self, destination, key, tensor):
+        """Map the official fused H3 checkpoint to the native weight layout."""
+        direct_names = {
+            "video_patch_proj": "proj_in",
+            "audio_patch_proj": "audio_proj_in",
+            "condition_proj": "context_embedder",
+            "time_embedder.proj_in": "time_embedder.linear_1",
+            "time_embedder.proj_out": "time_embedder.linear_2",
+            "final_layer.norm": "norm_out.norm",
+            "final_layer.adaln_proj.linear": "norm_out.linear",
+            "final_layer.video_out": "proj_out",
+            "final_layer.audio_out": "audio_proj_out",
+        }
+        for source_name, target_name in direct_names.items():
+            if key == source_name or key.startswith(source_name + "."):
+                self._store_converted_weight(destination, target_name + key[len(source_name) :], tensor)
+                return
+
+        if key == "rope.inv_freq":
+            # RoPE frequencies are reconstructed from config in pre-infer.
+            return
+
+        if key.startswith("token_refiner.blocks."):
+            key = key.replace("token_refiner.blocks.", "token_refiner.refiner_blocks.", 1)
+        elif key.startswith("blocks."):
+            key = key.replace("blocks.", "transformer_blocks.", 1)
+
+        replacements = (
+            (".attn.q_norm.", ".attn.norm_q."),
+            (".attn.k_norm.", ".attn.norm_k."),
+            (".attn.out_proj.", ".attn.to_out.0."),
+            (".mlp.fc1.", ".ff.net.0.proj."),
+            (".mlp.fc2.", ".ff.net.2."),
+        )
+        for source_name, target_name in replacements:
+            key = key.replace(source_name, target_name)
+
+        qkv_marker = ".attn.qkv_proj."
+        if qkv_marker in key:
+            if tensor.shape[0] % 3:
+                raise ValueError(f"MiniMax-H3 fused QKV tensor has invalid shape: {key}={tuple(tensor.shape)}")
+            prefix, suffix = key.split(qkv_marker, 1)
+            q, k, v = tensor.chunk(3, dim=0)
+            self._store_converted_weight(destination, f"{prefix}.attn.to_q.{suffix}", q)
+            self._store_converted_weight(destination, f"{prefix}.attn.to_k.{suffix}", k)
+            self._store_converted_weight(destination, f"{prefix}.attn.to_v.{suffix}", v)
+            return
+
+        self._store_converted_weight(destination, key, tensor)
 
     def _init_infer_class(self):
         if self.config.get("feature_caching", "NoCaching") != "NoCaching":

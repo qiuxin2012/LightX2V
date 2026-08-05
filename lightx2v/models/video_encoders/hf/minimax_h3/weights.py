@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, NamedTuple
 
 import torch
 import torch.nn as nn
@@ -37,6 +38,13 @@ class SafetensorsSubsetReport:
     files: tuple[Path, ...]
     loaded_keys: tuple[str, ...]
     ignored_keys: int
+
+
+class MappedTensorSpec(NamedTuple):
+    """Target key and shape produced by a checkpoint-key conversion."""
+
+    key: str
+    shape: tuple[int, ...]
 
 
 def _component_files(component_dir: str | Path) -> tuple[Path, ...]:
@@ -155,4 +163,90 @@ def load_safetensors_subset(module: nn.Module, component_dir: str | Path) -> Saf
     missing = sorted(expected - loaded)
     if missing:
         raise RuntimeError(f"Failed to load MiniMax-H3 tensors: {missing[:20]}")
+    return SafetensorsSubsetReport(report.component_dir, report.files, tuple(sorted(loaded)), report.ignored_keys)
+
+
+def validate_safetensors_mapped(
+    module: nn.Module,
+    component_dir: str | Path,
+    map_key: Callable[[str, tuple[int, ...]], tuple[MappedTensorSpec, ...]],
+) -> SafetensorsSubsetReport:
+    """Validate a checkpoint whose names/shapes are converted before loading."""
+
+    files = _component_files(component_dir)
+    expected = _expected_specs(module)
+    found: set[str] = set()
+    unexpected: list[str] = []
+    ignored = 0
+
+    for filename in files:
+        with safe_open(filename, framework="pt", device="cpu") as checkpoint:
+            for key in checkpoint.keys():
+                mapped = map_key(key, tuple(checkpoint.get_slice(key).get_shape()))
+                if not mapped:
+                    ignored += 1
+                    continue
+                for spec in mapped:
+                    if spec.key not in expected:
+                        unexpected.append(f"{key}->{spec.key}")
+                        continue
+                    expected_shape, expected_dtype = expected[spec.key]
+                    if spec.shape != expected_shape:
+                        raise ValueError(
+                            f"Shape mismatch for mapped {key!r}->{spec.key!r}: "
+                            f"model expects {expected_shape}, checkpoint conversion produces {spec.shape}"
+                        )
+                    checkpoint_dtype = str(checkpoint.get_slice(key).get_dtype())
+                    if checkpoint_dtype != _SAFETENSORS_DTYPES.get(expected_dtype):
+                        raise TypeError(
+                            f"Dtype mismatch for {key!r}: model expects {expected_dtype}, "
+                            f"checkpoint contains {checkpoint_dtype}"
+                        )
+                    if spec.key in found:
+                        unexpected.append(f"duplicate:{spec.key}")
+                    found.add(spec.key)
+
+    missing = sorted(set(expected) - found)
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append(f"missing={missing[:20]}{' ...' if len(missing) > 20 else ''}")
+        if unexpected:
+            details.append(f"unexpected={unexpected[:20]}{' ...' if len(unexpected) > 20 else ''}")
+        raise RuntimeError("MiniMax-H3 mapped checkpoint does not match the native module: " + ", ".join(details))
+
+    return SafetensorsSubsetReport(Path(component_dir), files, tuple(sorted(found)), ignored)
+
+
+def load_safetensors_mapped(
+    module: nn.Module,
+    component_dir: str | Path,
+    map_key: Callable[[str, tuple[int, ...]], tuple[MappedTensorSpec, ...]],
+    map_tensor: Callable[[str, torch.Tensor], tuple[tuple[str, torch.Tensor], ...]],
+) -> SafetensorsSubsetReport:
+    """Validate and stream-load a checkpoint after an explicit key conversion."""
+
+    report = validate_safetensors_mapped(module, component_dir, map_key)
+    expected_shapes = {key: tuple(value.shape) for key, value in module.state_dict().items()}
+    expected = set(expected_shapes)
+    loaded: set[str] = set()
+
+    for filename in report.files:
+        with safe_open(filename, framework="pt", device="cpu") as checkpoint:
+            for key in checkpoint.keys():
+                for target_key, tensor in map_tensor(key, checkpoint.get_tensor(key)):
+                    if target_key not in expected:
+                        raise KeyError(f"Mapped checkpoint key {target_key!r} is not a module parameter")
+                    expected_shape = expected_shapes[target_key]
+                    if tuple(tensor.shape) != expected_shape:
+                        raise ValueError(
+                            f"Mapped tensor shape mismatch for {key!r}->{target_key!r}: "
+                            f"model expects {expected_shape}, mapper produced {tuple(tensor.shape)}"
+                        )
+                    _assign_tensor(module, target_key, tensor)
+                    loaded.add(target_key)
+
+    missing = sorted(expected - loaded)
+    if missing:
+        raise RuntimeError(f"Failed to load mapped MiniMax-H3 tensors: {missing[:20]}")
     return SafetensorsSubsetReport(report.component_dir, report.files, tuple(sorted(loaded)), report.ignored_keys)

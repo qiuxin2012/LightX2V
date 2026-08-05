@@ -565,7 +565,6 @@ class _Qwen3VLTextBackboneWeights(WeightModule):
             raise ValueError(f"MiniMax-H3's native Qwen3-VL backbone expects unbatched token IDs, got {tuple(input_ids.shape)}")
         if self.block_offload:
             return self._forward_with_block_offload(input_ids, position_ids, vision_mask, vision_embeds, deepstack_embeds)
-
         hidden_states = self.embed_tokens.apply(input_ids)
         hidden_states = self._inject_vision_embeds(hidden_states, vision_mask, vision_embeds)
         position_embeddings = self._position_embeddings(hidden_states, position_ids)

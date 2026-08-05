@@ -42,7 +42,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from lightx2v.models.video_encoders.hf.minimax_h3.weights import (
+    MappedTensorSpec,
     SafetensorsSubsetReport,
+    load_safetensors_mapped,
     load_safetensors_subset,
 )
 from lightx2v_platform.base.global_var import AI_DEVICE
@@ -59,12 +61,78 @@ def _empty_device_cache(device: torch.device) -> None:
 
 def _component_dir(model_path: str | Path, component: str) -> Path:
     model_path = Path(model_path)
-    nested = model_path / component
-    if nested.is_dir():
-        return nested
-    if model_path.name == component and model_path.is_dir():
-        return model_path
-    raise FileNotFoundError(f"Cannot find MiniMax-H3 {component!r} below {model_path}")
+    component_names = ("vae", "video_vae") if component == "vae" else (component,)
+    for component_name in component_names:
+        nested = model_path / component_name
+        if nested.is_dir():
+            return nested
+        if model_path.name == component_name and model_path.is_dir():
+            return model_path
+    searched = ", ".join(repr(name) for name in component_names)
+    raise FileNotFoundError(f"Cannot find MiniMax-H3 component below {model_path}; searched {searched}")
+
+
+def _native_video_key_specs(key: str, shape: tuple[int, ...]) -> tuple[MappedTensorSpec, ...]:
+    """Map the released source VAE names to the compact native implementation."""
+
+    # The source ViT keeps this training-only buffer even though decode never
+    # enables masking.  The native decoder intentionally creates the same zero
+    # class token at runtime, so the checkpoint tensor is not needed.
+    if key == "decoder.mask_token":
+        return ()
+
+    if key.startswith("encoder.down."):
+        parts = key.split(".")
+        if parts[3] == "block":
+            key = "encoder.down_blocks.{}.resnets.{}.{}".format(parts[2], parts[4], ".".join(parts[5:]))
+        elif parts[3] == "downsample":
+            key = "encoder.down_blocks.{}.downsamplers.0.{}".format(parts[2], ".".join(parts[4:]))
+    key = key.replace(".nin_shortcut.", ".conv_shortcut.")
+    key = key.replace("decoder.x_embedder", "decoder.proj_in", 1)
+    key = key.replace(".attn.to_out.", ".attn.to_out.0.")
+    key = key.replace(".ff.w1.", ".ff.net.0.proj.")
+    key = key.replace(".ff.w2.", ".ff.net.2.")
+
+    if ".attn.to_qkv." in key:
+        if not shape or shape[0] % 3:
+            raise ValueError(f"Invalid MiniMax-H3 VAE QKV tensor {key!r} with shape {shape}")
+        prefix, suffix = key.split(".attn.to_qkv", 1)
+        split_shape = (shape[0] // 3,) + shape[1:]
+        return tuple(
+            MappedTensorSpec(prefix + ".attn.to_" + name + suffix, split_shape)
+            for name in ("q", "k", "v")
+        )
+    return (MappedTensorSpec(key, shape),)
+
+
+def _native_video_tensor_mapper(heads: int, dim_head: int):
+    """Build the tensor conversion corresponding to ``_native_video_key_specs``."""
+
+    def map_tensor(key: str, tensor: torch.Tensor) -> tuple[tuple[str, torch.Tensor], ...]:
+        specs = _native_video_key_specs(key, tuple(tensor.shape))
+        if not specs:
+            return ()
+
+        if ".attn.to_qkv." in key:
+            # The released linear layer stores [head, q/k/v, dim_head] in its
+            # flattened output.  The native implementation has separate
+            # linears with [q/k/v, head, dim_head] output rows.
+            if tensor.shape[0] != heads * 3 * dim_head:
+                raise ValueError(f"Unexpected MiniMax-H3 VAE QKV shape for {key!r}: {tuple(tensor.shape)}")
+            tail = tuple(tensor.shape[1:])
+            reshaped = tensor.reshape(heads, 3, dim_head, *tail)
+            permute_dims = (1, 0, 2, *range(3, 3 + len(tail)))
+            reordered = reshaped.permute(*permute_dims).reshape(3, heads * dim_head, *tail)
+            return tuple((spec.key, part.contiguous()) for spec, part in zip(specs, reordered.unbind(0)))
+
+        if ".ff.w1." in key:
+            # The source uses [gate, value], while the native SwiGLU expects
+            # [value, gate] before applying SiLU to the second half.
+            first, second = tensor.chunk(2, dim=0)
+            tensor = torch.cat((second, first), dim=0).contiguous()
+        return ((specs[0].key, tensor),)
+
+    return map_tensor
 
 
 class _SwiGLU(nn.Module):
@@ -509,12 +577,27 @@ class MiniMaxH3VideoVAE(nn.Module):
         with (vae_dir / "config.json").open("r", encoding="utf-8") as handle:
             config = json.load(handle)
 
+        source_dir = vae_dir / str(config.get("source_path", "source"))
+        source_name = str(config.get("source_safetensors_path", "model.safetensors"))
+        use_source_checkpoint = (source_dir / source_name).is_file()
+        weights_dir = source_dir if use_source_checkpoint else vae_dir
+
         # The released decoder is several GiB.  Constructing it on meta avoids
         # allocating and then immediately overwriting random initialized weights.
         with torch.device("meta"):
             model = cls(config, device=device, cpu_offload=cpu_offload)
         model._reset_runtime_buffers()
-        model.load_report = load_safetensors_subset(model, vae_dir)
+        if use_source_checkpoint:
+            first_block = model.decoder.transformer_blocks[0]
+            map_tensor = _native_video_tensor_mapper(first_block.attn.heads, first_block.attn.dim_head)
+            model.load_report = load_safetensors_mapped(
+                model,
+                weights_dir,
+                _native_video_key_specs,
+                map_tensor,
+            )
+        else:
+            model.load_report = load_safetensors_subset(model, weights_dir)
         model.eval().requires_grad_(False)
         if not cpu_offload:
             model.to(model.execution_device)
