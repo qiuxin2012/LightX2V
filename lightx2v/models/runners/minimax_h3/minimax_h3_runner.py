@@ -61,8 +61,6 @@ class MiniMaxH3Runner(DefaultRunner):
         if config.get("task") not in {"t2av", "i2av", "l2av", "fl2av", "ref2av"}:
             raise ValueError("MiniMax-H3 supports t2av/i2av/l2av/fl2av/ref2av")
         self.loaded_transformer_partition = "transformer_ref" if config["task"] == "ref2av" else "transformer"
-        if not config.get("cpu_offload", False):
-            raise ValueError("MiniMax-H3 currently requires cpu_offload=true so Qwen, DiT, and both VAEs can run sequentially without residing on one GPU together")
         if not config.get("text_encoder_cpu_offload", True) or not config.get("vae_cpu_offload", True):
             raise ValueError("MiniMax-H3 requires text_encoder_cpu_offload=true and vae_cpu_offload=true; the conditioner, DiT, and VAEs are intentionally resident on the accelerator one at a time.")
         offload_granularity = config.get("offload_granularity", "module")
@@ -76,6 +74,24 @@ class MiniMaxH3Runner(DefaultRunner):
         self.aux_rank = int(config.get("aux_rank", 0))
         if self.rank0_aux_only and not 0 <= self.aux_rank < dist.get_world_size():
             raise ValueError(f"MiniMax-H3 aux_rank must be in [0, {dist.get_world_size()}), got {self.aux_rank}")
+        self.qwen_tp_size = int(config.get("parallel", {}).get("qwen3vl_tensor_p_size", 1))
+        self.qwen_tp_group = None
+        self.qwen_tp_ranks = [self.aux_rank]
+        if self.qwen_tp_size > 1:
+            if config.get("task") != "t2av":
+                raise NotImplementedError("MiniMax-H3 Qwen3-VL tensor parallel currently supports T2AV only")
+            if not dist.is_initialized():
+                raise RuntimeError("MiniMax-H3 Qwen3-VL tensor parallel requires torch.distributed")
+            world_size = dist.get_world_size()
+            if world_size % self.qwen_tp_size:
+                raise ValueError(f"qwen3vl_tensor_p_size={self.qwen_tp_size} must divide world_size={world_size}")
+            group_start = self.aux_rank // self.qwen_tp_size * self.qwen_tp_size
+            self.qwen_tp_ranks = list(range(group_start, group_start + self.qwen_tp_size))
+            # TP=world (the common 8-XPU path) can reuse the initialized oneCCL
+            # world group. Only smaller, phase-local Qwen TP sizes need a
+            # separate subgroup.
+            self.qwen_tp_group = dist.group.WORLD if self.qwen_tp_size == world_size else dist.new_group(ranks=self.qwen_tp_ranks)
+        self.qwen_tp_member = not self.rank0_aux_only or dist.get_rank() in self.qwen_tp_ranks
         super().__init__(config)
 
     def init_modules(self):
@@ -101,9 +117,9 @@ class MiniMaxH3Runner(DefaultRunner):
         )
 
     def load_text_encoder(self):
-        if self.rank0_aux_only and dist.get_rank() != self.aux_rank:
+        if self.rank0_aux_only and not self.qwen_tp_member:
             return [None]
-        return [MiniMaxH3Qwen3VLTextEncoder(self.config)]
+        return [MiniMaxH3Qwen3VLTextEncoder(self.config, tp_group=self.qwen_tp_group)]
 
     def load_vae(self):
         if self.rank0_aux_only and dist.get_rank() != self.aux_rank:
@@ -146,7 +162,7 @@ class MiniMaxH3Runner(DefaultRunner):
         if not self.rank0_aux_only:
             return self.text_encoders[0].infer(input_info.prompt, image_list=keyframes, references=references)
 
-        output = self.text_encoders[0].infer(input_info.prompt, image_list=keyframes, references=references) if dist.get_rank() == self.aux_rank else None
+        output = self.text_encoders[0].infer(input_info.prompt, image_list=keyframes, references=references) if self.qwen_tp_member else None
         metadata = [None]
         if dist.get_rank() == self.aux_rank:
             metadata[0] = {
@@ -408,6 +424,9 @@ class MiniMaxH3Runner(DefaultRunner):
         return self.scheduler.video_latents, self.scheduler.audio_latents
 
     def _offload_transformer(self):
+        if not self.config.get("cpu_offload", False):
+            logger.info("Keeping MiniMax-H3 transformer resident on the accelerator because CPU offload is disabled")
+            return
         logger.info("Offloading MiniMax-H3 transformer before VAE decode")
         if self.config.get("offload_granularity") == "block":
             self.model.pre_weight.to_cpu()

@@ -46,6 +46,7 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
             )
         self.block_offload = config.get("cpu_offload", False) and config.get("offload_granularity") == "block"
         self.debug_sync = os.getenv("MINIMAX_H3_DEBUG_SYNC", "0") == "1"
+        self.debug_skip_xpu0_adaln = os.getenv("MINIMAX_H3_DEBUG_SKIP_XPU0_ADALN", "0") == "1"
         if self.block_offload:
             self.offload_manager = WeightAsyncStreamManager(offload_granularity="block")
         self.init_compile(config)
@@ -119,7 +120,57 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
     def infer_block(self, weights, hidden_states, pre_infer_out):
         # Activation is evaluated in fp32, then cast immediately before the
         # checkpoint's bf16 AdaLN projection.
-        modulation = weights.adaln.apply(F.silu(pre_infer_out.temb).to(GET_DTYPE()))
+        if self.debug_sync:
+            logger.info(f"[H3 debug][rank={dist.get_rank()}] AdaLN: synchronize before projection")
+            torch_device_module.synchronize()
+            logger.info(f"[H3 debug][rank={dist.get_rank()}] AdaLN: synchronize complete, preparing contiguous operands")
+        adaln_input = F.silu(pre_infer_out.temb).to(GET_DTYPE()).contiguous()
+        adaln_weight = weights.adaln._get_actual_weight()
+        adaln_bias = weights.adaln._get_actual_bias()
+        if self.debug_sync:
+            logger.info(
+                f"[H3 debug][rank={dist.get_rank()}] AdaLN input: "
+                f"shape={tuple(adaln_input.shape)}, stride={adaln_input.stride()}, "
+                f"dtype={adaln_input.dtype}, contiguous={adaln_input.is_contiguous()}, "
+                f"device={adaln_input.device}"
+            )
+            logger.info(
+                f"[H3 debug][rank={dist.get_rank()}] AdaLN weight before contiguous: "
+                f"shape={tuple(adaln_weight.shape)}, stride={adaln_weight.stride()}, "
+                f"contiguous={adaln_weight.is_contiguous()}, device={adaln_weight.device}"
+            )
+        adaln_bias = adaln_bias.contiguous()
+        original_rows = adaln_input.shape[0]
+        skip_projection = self.debug_skip_xpu0_adaln and adaln_input.device.type == "xpu" and adaln_input.device.index == 0
+        if skip_projection:
+            logger.warning(
+                f"[H3 debug][rank={dist.get_rank()}] AdaLN: skipping projection on xpu:0; "
+                f"using random output with shape=({original_rows}, {adaln_weight.shape[1]})"
+            )
+            modulation = torch.randn(
+                (original_rows, adaln_weight.shape[1]),
+                dtype=adaln_input.dtype,
+                device=adaln_input.device,
+            )
+        elif original_rows == 1:
+            adaln_mv_weight = adaln_weight.transpose(0, 1).contiguous()
+            if self.debug_sync:
+                torch_device_module.synchronize()
+                logger.info(f"[H3 debug][rank={dist.get_rank()}] AdaLN: M=1, running mv")
+            modulation = torch.mv(adaln_mv_weight, adaln_input[0]).unsqueeze(0)
+        else:
+            adaln_weight = adaln_weight.contiguous()
+            if self.debug_sync:
+                torch_device_module.synchronize()
+                logger.info(f"[H3 debug][rank={dist.get_rank()}] AdaLN: M={original_rows}, running mm")
+            modulation = torch.mm(adaln_input, adaln_weight)
+        if self.debug_sync:
+            torch_device_module.synchronize()
+            logger.info(f"[H3 debug][rank={dist.get_rank()}] AdaLN: projection complete, adding bias")
+        modulation.add_(adaln_bias)
+        if self.debug_sync:
+            torch_device_module.synchronize()
+            logger.info(f"[H3 debug][rank={dist.get_rank()}] AdaLN: bias add complete")
         if self.tp_group is not None:
             gathered_modulation = [torch.empty_like(modulation) for _ in range(self.tp_size)]
             dist.all_gather(gathered_modulation, modulation, group=self.tp_group)

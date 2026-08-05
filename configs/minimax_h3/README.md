@@ -44,6 +44,21 @@ MiniMax-H3/
 - `module`：整个 DiT 在去噪开始前搬到设备，结束后搬回 CPU；旧配置值 `model` 作为兼容别名保留。
 - `block`：50 个 transformer blocks 常驻 pinned CPU memory，设备上保留两个 block buffer，计算当前 block 时异步预取下一个 block。
 
+纯文本 `t2av` 还支持独立的 Qwen3-VL tensor parallel。`parallel.tensor_p_size`
+只控制 DiT，`parallel.qwen3vl_tensor_p_size` 只控制 Qwen3-VL；后者是阶段性的
+进程子组，不参与 distributed world size 的乘积。当前支持能同时整除 64 个 Q heads、
+8 个 KV heads、25600 intermediate size 和 151936 vocabulary size 的值，在 8 卡上
+通常使用 1、2、4 或 8。省略时默认为 1，以保持原来的单 `aux_rank` 编码行为。
+
+8 卡 DiT TP=8、Qwen3-VL TP=8 + block offload 使用：
+
+```bash
+MODEL_PATH=/llm/models/MiniMax-H3/FL2VA \
+bash scripts/minimax_h3/run_minimax_h3_t2av_tp8.sh
+```
+
+Qwen TP 目前仅覆盖无图像输入的 `t2av`；视觉塔仍保持单 rank 路径。
+
 DiT 支持 Ulysses sequence parallel。H3 的 video rows 在 SP ranks 间切分，变长的 text/audio rows 在组内复制，因此不会为 packed sequence 引入会污染 softmax 的 padding token。当前只支持 `seq_p_attn_type: "ulysses"`，且 `seq_p_size` 必须整除 56 个 attention heads（例如 2、4、7、8）。默认使用 4 卡：
 
 ```bash

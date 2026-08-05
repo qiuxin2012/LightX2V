@@ -21,6 +21,7 @@ from contextlib import suppress
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from loguru import logger
 from safetensors import safe_open
@@ -143,8 +144,9 @@ class _MiniMaxH3QwenSDPAWeight(AttnWeightTemplate):
 
 
 class _Qwen3VLMLPWeights(WeightModule):
-    def __init__(self, prefix):
+    def __init__(self, prefix, tp_group=None):
         super().__init__()
+        self.tp_group = tp_group
         self.add_module("gate_proj", MM_WEIGHT_REGISTER["Default"](f"{prefix}.gate_proj.weight"))
         self.add_module("up_proj", MM_WEIGHT_REGISTER["Default"](f"{prefix}.up_proj.weight"))
         self.add_module("down_proj", MM_WEIGHT_REGISTER["Default"](f"{prefix}.down_proj.weight"))
@@ -152,14 +154,19 @@ class _Qwen3VLMLPWeights(WeightModule):
     def forward(self, hidden_states):
         gate = self.gate_proj.apply(hidden_states)
         up = self.up_proj.apply(hidden_states)
-        return self.down_proj.apply(F.silu(gate) * up)
+        output = self.down_proj.apply(F.silu(gate) * up)
+        if self.tp_group is not None:
+            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.tp_group)
+        return output
 
 
 class _Qwen3VLAttentionWeights(WeightModule):
-    def __init__(self, prefix, text_config, attn_type):
+    def __init__(self, prefix, text_config, attn_type, tp_group=None):
         super().__init__()
-        self.num_heads = int(text_config["num_attention_heads"])
-        self.num_key_value_heads = int(text_config["num_key_value_heads"])
+        self.tp_group = tp_group
+        tp_size = dist.get_world_size(tp_group) if tp_group is not None else 1
+        self.num_heads = int(text_config["num_attention_heads"]) // tp_size
+        self.num_key_value_heads = int(text_config["num_key_value_heads"]) // tp_size
         self.head_dim = int(text_config["head_dim"])
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.softmax_scale = self.head_dim**-0.5
@@ -199,8 +206,8 @@ class _Qwen3VLAttentionWeights(WeightModule):
         key = key * cos + _rotate_half(key) * sin
 
         # The released Qwen model keeps eight KV heads and uses torch SDPA's
-        # native GQA specialization.  Preserve that CUDA kernel path for close
-        # numerical parity; other common backends require materialized heads.
+        # native GQA specialization. Preserve that device-native kernel path
+        # for close numerical parity; other backends require materialized heads.
         if not self.native_gqa:
             key = _repeat_kv(key, self.num_key_value_groups)
             value = _repeat_kv(value, self.num_key_value_groups)
@@ -213,11 +220,14 @@ class _Qwen3VLAttentionWeights(WeightModule):
             max_seqlen_kv=sequence_length,
             softmax_scale=self.softmax_scale,
         )
-        return self.o_proj.apply(attention_output)
+        output = self.o_proj.apply(attention_output)
+        if self.tp_group is not None:
+            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.tp_group)
+        return output
 
 
 class _Qwen3VLDecoderLayerWeights(WeightModule):
-    def __init__(self, layer_index, text_config, attn_type):
+    def __init__(self, layer_index, text_config, attn_type, tp_group=None):
         super().__init__()
         prefix = f"{_CHECKPOINT_PREFIX}.layers.{layer_index}"
         eps = float(text_config["rms_norm_eps"])
@@ -231,9 +241,9 @@ class _Qwen3VLDecoderLayerWeights(WeightModule):
         )
         self.add_module(
             "self_attn",
-            _Qwen3VLAttentionWeights(f"{prefix}.self_attn", text_config, attn_type),
+            _Qwen3VLAttentionWeights(f"{prefix}.self_attn", text_config, attn_type, tp_group=tp_group),
         )
-        self.add_module("mlp", _Qwen3VLMLPWeights(f"{prefix}.mlp"))
+        self.add_module("mlp", _Qwen3VLMLPWeights(f"{prefix}.mlp", tp_group=tp_group))
 
     def forward(self, hidden_states, position_embeddings):
         residual = hidden_states
@@ -248,11 +258,17 @@ class _Qwen3VLDecoderLayerWeights(WeightModule):
 class _Qwen3VLTextBackboneWeights(WeightModule):
     """Unbatched native prefix of Qwen3-VL's language backbone."""
 
-    def __init__(self, text_config, num_layers=MINIMAX_H3_TEXT_ENCODER_LAYER, attn_type="torch_sdpa"):
+    def __init__(self, text_config, num_layers=MINIMAX_H3_TEXT_ENCODER_LAYER, attn_type="torch_sdpa", tp_group=None):
         super().__init__()
         self.text_config = text_config
+        self.tp_group = tp_group
+        self.tp_size = dist.get_world_size(tp_group) if tp_group is not None else 1
+        self.tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
         self.num_layers = int(num_layers)
         self.hidden_size = int(text_config["hidden_size"])
+        self.vocab_size = int(text_config["vocab_size"])
+        self.vocab_start = self.vocab_size // self.tp_size * self.tp_rank
+        self.vocab_end = self.vocab_size // self.tp_size * (self.tp_rank + 1)
         self.head_dim = int(text_config["head_dim"])
         self.rope_theta = float(text_config["rope_theta"])
         self.add_module(
@@ -261,7 +277,7 @@ class _Qwen3VLTextBackboneWeights(WeightModule):
         )
         self.add_module(
             "layers",
-            WeightModuleList(_Qwen3VLDecoderLayerWeights(index, text_config, attn_type) for index in range(self.num_layers)),
+            WeightModuleList(_Qwen3VLDecoderLayerWeights(index, text_config, attn_type, tp_group=tp_group) for index in range(self.num_layers)),
         )
         self._weight_modules = self._collect_weight_modules()
 
@@ -293,6 +309,31 @@ class _Qwen3VLTextBackboneWeights(WeightModule):
 
     def named_weight_modules(self):
         return self._weight_modules.items()
+
+    def checkpoint_slice(self, name, shape):
+        """Return this TP rank's slice in a released full-weight tensor."""
+        if self.tp_size == 1:
+            return tuple(slice(None) for _ in shape)
+        column_suffixes = (
+            ".self_attn.q_proj.weight",
+            ".self_attn.k_proj.weight",
+            ".self_attn.v_proj.weight",
+            ".mlp.gate_proj.weight",
+            ".mlp.up_proj.weight",
+        )
+        row_suffixes = (".self_attn.o_proj.weight", ".mlp.down_proj.weight")
+        if name == f"{_CHECKPOINT_PREFIX}.embed_tokens.weight" or name.endswith(column_suffixes):
+            split_dim = 0
+        elif name.endswith(row_suffixes):
+            split_dim = 1
+        else:
+            return tuple(slice(None) for _ in shape)
+        if shape[split_dim] % self.tp_size:
+            raise ValueError(f"Cannot shard Qwen3-VL tensor {name} with shape {shape} over TP={self.tp_size}")
+        shard_size = shape[split_dim] // self.tp_size
+        slices = [slice(None) for _ in shape]
+        slices[split_dim] = slice(self.tp_rank * shard_size, (self.tp_rank + 1) * shard_size)
+        return tuple(slices)
 
     @staticmethod
     def _layer_weight_modules(layer):
@@ -350,7 +391,14 @@ class _Qwen3VLTextBackboneWeights(WeightModule):
         if layerwise_offload:
             self.embed_tokens.to_cuda()
             input_ids = input_ids.to(self.embed_tokens.weight.device)
-        hidden_states = self.embed_tokens.apply(input_ids)
+        if self.tp_size > 1:
+            local_mask = (input_ids >= self.vocab_start) & (input_ids < self.vocab_end)
+            local_input_ids = (input_ids - self.vocab_start).masked_fill(~local_mask, 0)
+            hidden_states = self.embed_tokens.apply(local_input_ids)
+            hidden_states.masked_fill_(~local_mask[:, None], 0)
+            dist.all_reduce(hidden_states, op=dist.ReduceOp.SUM, group=self.tp_group)
+        else:
+            hidden_states = self.embed_tokens.apply(input_ids)
         if layerwise_offload:
             self._restore_host_weights((self.embed_tokens,))
             _empty_device_cache()
@@ -393,8 +441,10 @@ class _Qwen3VLTextBackboneWeights(WeightModule):
 class MiniMaxH3Qwen3VLTextEncoder:
     """Encode one text-only request with the native first 50 Qwen3-VL layers."""
 
-    def __init__(self, config):
+    def __init__(self, config, tp_group=None):
         self.config = config
+        self.tp_group = tp_group
+        self.tp_size = dist.get_world_size(tp_group) if tp_group is not None else 1
         text_encoder_cpu_offload = bool(config.get("text_encoder_cpu_offload", config.get("cpu_offload", False)))
         if "qwen3vl_cpu_offload" in config and bool(config["qwen3vl_cpu_offload"]) != text_encoder_cpu_offload:
             raise ValueError("qwen3vl_cpu_offload cannot override text_encoder_cpu_offload for MiniMax-H3; the runner schedules the native conditioner through text_encoder_cpu_offload")
@@ -577,10 +627,11 @@ class MiniMaxH3Qwen3VLTextEncoder:
             raise ValueError(f"MiniMax-H3 Qwen3-VL weights must use one floating dtype, got {sorted(checkpoint_dtypes)}")
 
         logger.info(
-            "Loading {} native Qwen3-VL tensors (embedding + layers 0..{}) from {} shards",
+            "Loading {} native Qwen3-VL tensors (embedding + layers 0..{}) from {} shards with TP={}",
             len(modules),
             MINIMAX_H3_TEXT_ENCODER_LAYER - 1,
             len(by_shard),
+            backbone.tp_size,
         )
         for shard_index, shard_name in enumerate(sorted(by_shard), start=1):
             shard_path = root / shard_name
@@ -592,7 +643,8 @@ class MiniMaxH3Qwen3VLTextEncoder:
             )
             with safe_open(shard_path, framework="pt", device="cpu") as checkpoint:
                 for name in by_shard[shard_name]:
-                    one_tensor = {name: checkpoint.get_tensor(name)}
+                    tensor_slice = checkpoint.get_slice(name)
+                    one_tensor = {name: tensor_slice[backbone.checkpoint_slice(name, expected_shapes[name])].contiguous()}
                     module = modules[name]
                     if module is backbone.embed_tokens:
                         # The released embedding table is about 1.55 GiB.
@@ -648,12 +700,23 @@ class MiniMaxH3Qwen3VLTextEncoder:
         text_encoder_path = self._component_path("text_encoder_path", "text_encoder")
         text_config = self._read_text_config(text_encoder_path)
         self._validate_text_config(text_config)
+        if self.tp_size > 1:
+            tp_dimensions = {
+                "attention heads": int(text_config["num_attention_heads"]),
+                "KV heads": int(text_config["num_key_value_heads"]),
+                "intermediate size": int(text_config["intermediate_size"]),
+                "vocabulary size": int(text_config["vocab_size"]),
+            }
+            incompatible = [name for name, size in tp_dimensions.items() if size % self.tp_size]
+            if incompatible:
+                raise ValueError(f"Qwen3-VL TP={self.tp_size} does not divide {', '.join(incompatible)}")
         attn_type = self._resolve_attn_type(self.config)
         logger.info(f"Building native MiniMax-H3 Qwen3-VL prefix from {text_encoder_path} with attention operator {attn_type}")
         text_encoder = _Qwen3VLTextBackboneWeights(
             text_config,
             num_layers=MINIMAX_H3_TEXT_ENCODER_LAYER,
             attn_type=attn_type,
+            tp_group=self.tp_group,
         )
         self._load_native_weights(text_encoder, text_encoder_path, text_config)
         if not self.cpu_offload:
@@ -853,8 +916,12 @@ class MiniMaxH3Qwen3VLTextEncoder:
             # try/finally.  Keep migration here so a partially failed transfer
             # still reaches the conditioner-specific offload cleanup below.
             if references is not None:
+                if self.tp_size > 1:
+                    raise NotImplementedError("MiniMax-H3 Qwen3-VL tensor parallel currently supports text-only T2AV conditioning")
                 prepared = self._prepare_reference_inputs(prompt, references)
             elif image_list:
+                if self.tp_size > 1:
+                    raise NotImplementedError("MiniMax-H3 Qwen3-VL tensor parallel currently supports text-only T2AV conditioning")
                 prepared = self._prepare_keyframe_inputs(prompt, image_list)
             else:
                 prepared = None

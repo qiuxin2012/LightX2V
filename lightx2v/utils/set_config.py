@@ -471,12 +471,33 @@ def set_parallel_config(config):
         tensor_p_size = int(config["parallel"].get("tensor_p_size", 1))
         cfg_p_size = int(config["parallel"].get("cfg_p_size", 1))
         seq_p_size = int(config["parallel"].get("seq_p_size", 1))
+        qwen3vl_tensor_p_size = int(config["parallel"].get("qwen3vl_tensor_p_size", 1))
         world_size = dist.get_world_size()
         expected_world_size = tensor_p_size * cfg_p_size * seq_p_size
         if expected_world_size != world_size:
             raise ValueError(
                 f"Parallel sizes must match the distributed world size: tensor_p_size ({tensor_p_size}) * cfg_p_size ({cfg_p_size}) * seq_p_size ({seq_p_size}) != world_size ({world_size})."
             )
+
+        if "qwen3vl_tensor_p_size" in config["parallel"] and config.get("model_cls") != "minimax_h3":
+            raise ValueError("parallel.qwen3vl_tensor_p_size is only supported by MiniMax-H3")
+        if config.get("model_cls") == "minimax_h3":
+            if qwen3vl_tensor_p_size < 1:
+                raise ValueError(f"MiniMax-H3 qwen3vl_tensor_p_size must be >= 1, got {qwen3vl_tensor_p_size}")
+            if qwen3vl_tensor_p_size > 1 and config.get("task") != "t2av":
+                raise NotImplementedError("MiniMax-H3 Qwen3-VL tensor parallel currently supports T2AV only")
+            if world_size % qwen3vl_tensor_p_size:
+                raise ValueError(f"MiniMax-H3 qwen3vl_tensor_p_size must divide the distributed world size: qwen3vl_tensor_p_size={qwen3vl_tensor_p_size}, world_size={world_size}")
+            qwen_dims = {
+                "attention heads": 64,
+                "KV heads": 8,
+                "intermediate size": 25600,
+                "vocabulary size": 151936,
+            }
+            incompatible = [name for name, size in qwen_dims.items() if size % qwen3vl_tensor_p_size]
+            if incompatible:
+                raise ValueError(f"MiniMax-H3 qwen3vl_tensor_p_size must divide the released Qwen3-VL {', '.join(incompatible)}; got {qwen3vl_tensor_p_size}")
+            config["parallel"]["qwen3vl_tensor_p_size"] = qwen3vl_tensor_p_size
 
         if tensor_p_size > 1:
             # Tensor parallel is the innermost dimension. Optional CFG and
