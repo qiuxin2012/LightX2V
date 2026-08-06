@@ -12,6 +12,7 @@ class MiniMaxH3SequenceParallelState:
     timestep_indices: torch.Tensor
     adaln_indices: torch.Tensor
     rotary_emb: tuple[torch.Tensor, torch.Tensor]
+    rotary_freqs: torch.Tensor | None
 
 
 @dataclass
@@ -21,6 +22,7 @@ class MiniMaxH3PreInferOutput:
     timestep_indices: torch.Tensor
     adaln_indices: torch.Tensor
     rotary_emb: tuple[torch.Tensor, torch.Tensor]
+    rotary_freqs: torch.Tensor | None
     video_indices: torch.Tensor
     audio_indices: torch.Tensor
     text_indices: torch.Tensor

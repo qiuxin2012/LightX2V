@@ -72,7 +72,7 @@ class MiniMaxH3PreInfer:
             text_embeds = text_embeds + self._ff(block.ff, block.norm2.apply(text_embeds))
         return weights.refiner_final_norm.apply(text_embeds)
 
-    def _rotary_embedding(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _rotary_embedding(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         position_ids = position_ids.to(torch.float32)
         inv_freq = 1.0 / (
             self.rope_theta
@@ -91,7 +91,7 @@ class MiniMaxH3PreInfer:
         freqs_t, freqs_h, freqs_w = freqs.unbind(dim=1)
         freqs = torch.cat((freqs_t, freqs_h, freqs_w), dim=-1)
         freqs = torch.cat((freqs, freqs), dim=-1)
-        return freqs.cos(), freqs.sin()
+        return freqs, (freqs.cos(), freqs.sin())
 
     def infer(self, weights, prompt_embeds):
         layout = self.scheduler.layout
@@ -112,12 +112,16 @@ class MiniMaxH3PreInfer:
         timestep_indices = self.scheduler.timestep_indices
         adaln_indices = timestep_indices * 3 + layout.token_tags.clamp(min=0)
 
+        rotary_freqs, rotary_emb = self._rotary_embedding(layout.position_ids)
+        if not self.config.get("use_xpu_fused_qk_rmsnorm_rope", False):
+            rotary_freqs = None
         return MiniMaxH3PreInferOutput(
             hidden_states=hidden_states,
             temb=temb,
             timestep_indices=timestep_indices,
             adaln_indices=adaln_indices,
-            rotary_emb=self._rotary_embedding(layout.position_ids),
+            rotary_emb=rotary_emb,
+            rotary_freqs=rotary_freqs,
             video_indices=layout.video_indices,
             audio_indices=layout.audio_indices,
             text_indices=layout.text_indices,

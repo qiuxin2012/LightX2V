@@ -1,9 +1,26 @@
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from loguru import logger
 
 from lightx2v.common.transformer_infer.transformer_infer import BaseTransformerInfer
 from lightx2v.utils.envs import GET_DTYPE
+
+
+def _load_sycl_kernel(name, enabled):
+    if not enabled:
+        return None
+    try:
+        import sycl_kernels
+    except (ImportError, OSError) as error:
+        logger.warning("MiniMax-H3 XPU kernel {} is unavailable: {}", name, error)
+        return None
+    operation = getattr(sycl_kernels, name, None)
+    if operation is None:
+        logger.warning("MiniMax-H3 XPU kernel {} is not exported by the installed sycl_kernels package", name)
+        return None
+    logger.info("MiniMax-H3 enabled XPU kernel {}", name)
+    return operation
 
 
 class MiniMaxH3TransformerInfer(BaseTransformerInfer):
@@ -21,6 +38,14 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
             self.tp_rank = 0
         self.num_heads = self.global_num_heads // self.tp_size
         self.head_dim = int(config.get("attention_head_dim", 128))
+        self.fused_qk_rmsnorm_rope = _load_sycl_kernel(
+            "fused_minimax_h3_qk_rmsnorm_rope",
+            config.get("use_xpu_fused_qk_rmsnorm_rope", False),
+        )
+        self.fused_indexed_rms_adaln = _load_sycl_kernel(
+            "fused_minimax_h3_indexed_rms_adaln",
+            config.get("use_xpu_fused_indexed_rms_adaln", False),
+        )
         if config.get("seq_parallel", False):
             self.seq_p_group = config["device_mesh"].get_group(mesh_dim="seq_p")
             parallel = config.get("parallel", {})
@@ -47,14 +72,26 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
         q = weights.to_q.apply(hidden_states).unflatten(-1, (self.num_heads, self.head_dim))
         k = weights.to_k.apply(hidden_states).unflatten(-1, (self.num_heads, self.head_dim))
         v = weights.to_v.apply(hidden_states).unflatten(-1, (self.num_heads, self.head_dim))
-        q = weights.norm_q.apply(q)
-        k = weights.norm_k.apply(k)
-        q, k = weights.rope.apply(
-            q,
-            k,
-            pre_infer_out.rotary_emb,
-            rotary_dim=pre_infer_out.rotary_emb[0].shape[-1],
-        )
+        if self.fused_qk_rmsnorm_rope is not None and q.device.type == "xpu":
+            if pre_infer_out.rotary_freqs is None:
+                raise RuntimeError("MiniMax-H3 fused Q/K RMSNorm + RoPE requires raw rotary frequencies")
+            q, k = self.fused_qk_rmsnorm_rope(
+                weights.norm_q.weight,
+                weights.norm_k.weight,
+                q,
+                k,
+                pre_infer_out.rotary_freqs,
+                eps=weights.norm_q.eps,
+            )
+        else:
+            q = weights.norm_q.apply(q)
+            k = weights.norm_k.apply(k)
+            q, k = weights.rope.apply(
+                q,
+                k,
+                pre_infer_out.rotary_emb,
+                rotary_dim=pre_infer_out.rotary_emb[0].shape[-1],
+            )
         sp_state = pre_infer_out.sequence_parallel_state
         if sp_state is None:
             seq_len = q.shape[0]
@@ -107,15 +144,35 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
         indices = pre_infer_out.adaln_indices
 
         residual = hidden_states
-        normed = weights.norm1.apply(hidden_states)
-        normed = normed * (1.0 + scale_msa.index_select(0, indices))
-        normed = normed + shift_msa.index_select(0, indices)
+        if self.fused_indexed_rms_adaln is not None and hidden_states.device.type == "xpu":
+            normed = self.fused_indexed_rms_adaln(
+                weights.norm1.weight,
+                hidden_states,
+                scale_msa,
+                shift_msa,
+                indices,
+                eps=weights.norm1.eps,
+            )
+        else:
+            normed = weights.norm1.apply(hidden_states)
+            normed = normed * (1.0 + scale_msa.index_select(0, indices))
+            normed = normed + shift_msa.index_select(0, indices)
         hidden_states = residual + gate_msa.index_select(0, indices) * self._attention(weights.attn, normed, pre_infer_out)
 
         residual = hidden_states
-        normed = weights.norm2.apply(hidden_states)
-        normed = normed * (1.0 + scale_mlp.index_select(0, indices))
-        normed = normed + shift_mlp.index_select(0, indices)
+        if self.fused_indexed_rms_adaln is not None and hidden_states.device.type == "xpu":
+            normed = self.fused_indexed_rms_adaln(
+                weights.norm2.weight,
+                hidden_states,
+                scale_mlp,
+                shift_mlp,
+                indices,
+                eps=weights.norm2.eps,
+            )
+        else:
+            normed = weights.norm2.apply(hidden_states)
+            normed = normed * (1.0 + scale_mlp.index_select(0, indices))
+            normed = normed + shift_mlp.index_select(0, indices)
         hidden_states = residual + gate_mlp.index_select(0, indices) * self._ff(weights.ff, normed)
         return hidden_states
 

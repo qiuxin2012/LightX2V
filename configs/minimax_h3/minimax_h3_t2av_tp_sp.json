@@ -16,6 +16,8 @@
   "attn_type": "torch_sdpa",
   "rms_type": "sgl-kernel",
   "rope_type": "minimax_h3_triton_rope",
+  "use_xpu_fused_qk_rmsnorm_rope": true,
+  "use_xpu_fused_indexed_rms_adaln": true,
   "feature_caching": "NoCaching",
   "use_compile": false,
   "video_flow_shift": 12.0,

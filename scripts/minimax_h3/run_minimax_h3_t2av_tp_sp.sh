@@ -6,6 +6,7 @@ model_path=/llm/models/MiniMax-H3
 export PLATFORM=intel_xpu
 
 source ${lightx2v_path}/scripts/base/base.sh
+export PYTHONPATH=${lightx2v_path}/lightx2v_kernel_xpu/python:${PYTHONPATH}
 export DTYPE=BF16
 export SENSITIVE_LAYER_DTYPE=FP32
 

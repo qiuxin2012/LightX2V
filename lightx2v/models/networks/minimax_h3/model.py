@@ -325,11 +325,14 @@ class MiniMaxH3Model(BaseTransformerModel):
             timestep_indices=pre_infer_out.timestep_indices,
             adaln_indices=pre_infer_out.adaln_indices,
             rotary_emb=pre_infer_out.rotary_emb,
+            rotary_freqs=pre_infer_out.rotary_freqs,
         )
         pre_infer_out.hidden_states = shard_sequence(pre_infer_out.hidden_states)
         pre_infer_out.timestep_indices = shard_sequence(pre_infer_out.timestep_indices)
         pre_infer_out.adaln_indices = shard_sequence(pre_infer_out.adaln_indices)
         pre_infer_out.rotary_emb = tuple(shard_sequence(tensor) for tensor in pre_infer_out.rotary_emb)
+        if pre_infer_out.rotary_freqs is not None:
+            pre_infer_out.rotary_freqs = shard_sequence(pre_infer_out.rotary_freqs)
         return pre_infer_out
 
     @torch.no_grad()
@@ -347,6 +350,7 @@ class MiniMaxH3Model(BaseTransformerModel):
         pre_infer_out.timestep_indices = state.timestep_indices
         pre_infer_out.adaln_indices = state.adaln_indices
         pre_infer_out.rotary_emb = state.rotary_emb
+        pre_infer_out.rotary_freqs = state.rotary_freqs
         pre_infer_out.sequence_parallel_state = None
         return output
 

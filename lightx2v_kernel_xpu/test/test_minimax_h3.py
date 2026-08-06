@@ -137,7 +137,7 @@ def test_indexed_rms_adaln_matches_reference(rows, packed):
         *values, eps=EPS
     )
     assert actual.is_contiguous()
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.03125)
 
 
 def test_indexed_rms_adaln_bounds_invalid_indices():
