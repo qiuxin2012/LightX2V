@@ -15,6 +15,7 @@
 //
 
 #include <optional>
+#include <tuple>
 #include <torch/extension.h>
 
 torch::Tensor onednn_w4a16(
@@ -38,6 +39,27 @@ torch::Tensor sdp_torch(
     torch::Tensor V
 );
 
+namespace omni_xpu {
+namespace norm {
+std::tuple<torch::Tensor, torch::Tensor>
+fused_minimax_h3_qk_rmsnorm_rope(
+    const torch::Tensor& q_weight,
+    const torch::Tensor& k_weight,
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& freqs,
+    double eps);
+
+torch::Tensor fused_minimax_h3_indexed_rms_adaln(
+    const torch::Tensor& weight,
+    const torch::Tensor& input,
+    const torch::Tensor& scale,
+    const torch::Tensor& shift,
+    const torch::Tensor& indices,
+    double eps);
+}  // namespace norm
+}  // namespace omni_xpu
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("onednn_w4a16", &onednn_w4a16, "onednn w4a16 gemm");
     m.def("onednn_w8a16_fp8", &onednn_w8a16_fp8,
@@ -47,4 +69,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("sdp", &sdp_torch,
           "ESIMD Flash Attention SDP [B,L,H,128] PTL-H (fp16/bf16)",
           py::arg("Q"), py::arg("K"), py::arg("V"));
+    m.def(
+        "fused_minimax_h3_qk_rmsnorm_rope",
+        &omni_xpu::norm::fused_minimax_h3_qk_rmsnorm_rope,
+        "Fused MiniMax-H3 per-head Q/K RMSNorm and partial split-half RoPE",
+        py::arg("q_weight"), py::arg("k_weight"), py::arg("q"),
+        py::arg("k"), py::arg("freqs"), py::arg("eps") = 1e-5);
+    m.def(
+        "fused_minimax_h3_indexed_rms_adaln",
+        &omni_xpu::norm::fused_minimax_h3_indexed_rms_adaln,
+        "Fused MiniMax-H3 RMSNorm and indexed AdaLN modulation",
+        py::arg("weight"), py::arg("input"), py::arg("scale"),
+        py::arg("shift"), py::arg("indices"), py::arg("eps") = 1e-5);
 }
