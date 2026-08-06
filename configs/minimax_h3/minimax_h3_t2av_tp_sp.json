@@ -28,6 +28,7 @@
   "parallel": {
     "tensor_p_size": 4,
     "seq_p_size": 2,
-    "seq_p_attn_type": "ulysses"
+    "seq_p_attn_type": "ulysses",
+    "seq_p_a2a_backend": "torch"
   }
 }

@@ -19,6 +19,7 @@ def _linear(config, name, bias=False, create_cuda_buffer=False, tp_split=None):
             tp_size=dist.get_world_size(tp_group),
             split_dim=tp_split,
             create_cuda_buffer=create_cuda_buffer,
+            use_all_gather_reduce=config.get("seq_parallel", False),
         )
     return MM_WEIGHT_REGISTER[config.get("dit_quant_scheme", "Default")](
         f"{name}.weight",
