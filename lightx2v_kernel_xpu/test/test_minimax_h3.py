@@ -1,8 +1,6 @@
 import pytest
-import torch
-
 import sycl_kernels
-
+import torch
 
 pytestmark = pytest.mark.skipif(
     not torch.xpu.is_available(),
@@ -34,15 +32,11 @@ def _qk_inputs(rows, heads, packed):
         q = q.view(rows, heads, HEAD_DIM)
         k = k.view(rows, heads, HEAD_DIM)
     else:
-        q = torch.randn(
-            rows, heads, HEAD_DIM, device="xpu", dtype=torch.bfloat16
-        )
+        q = torch.randn(rows, heads, HEAD_DIM, device="xpu", dtype=torch.bfloat16)
         k = torch.randn_like(q)
     q_weight = torch.randn(HEAD_DIM, device="xpu", dtype=torch.bfloat16)
     k_weight = torch.randn_like(q_weight)
-    freqs = torch.randn(
-        rows, ROTARY_DIM, device="xpu", dtype=torch.float32
-    )
+    freqs = torch.randn(rows, ROTARY_DIM, device="xpu", dtype=torch.float32)
     return q_weight, k_weight, q, k, freqs
 
 
@@ -66,9 +60,7 @@ def test_qk_rmsnorm_rope_matches_reference(heads, packed):
     q_expected = _qk_reference(q_weight, q, freqs)
     k_expected = _qk_reference(k_weight, k, freqs)
 
-    q_actual, k_actual = sycl_kernels.fused_minimax_h3_qk_rmsnorm_rope(
-        *values, eps=EPS
-    )
+    q_actual, k_actual = sycl_kernels.fused_minimax_h3_qk_rmsnorm_rope(*values, eps=EPS)
 
     assert q_actual.is_contiguous()
     assert k_actual.is_contiguous()
@@ -82,9 +74,7 @@ def test_qk_rmsnorm_rope_uses_current_stream():
         values = _qk_inputs(17, 14, True)
         q_expected = _qk_reference(values[0], values[2], values[4])
         k_expected = _qk_reference(values[1], values[3], values[4])
-        q_actual, k_actual = sycl_kernels.fused_minimax_h3_qk_rmsnorm_rope(
-            *values, eps=EPS
-        )
+        q_actual, k_actual = sycl_kernels.fused_minimax_h3_qk_rmsnorm_rope(*values, eps=EPS)
     stream.synchronize()
     torch.testing.assert_close(q_actual, q_expected, rtol=0.02, atol=0.03125)
     torch.testing.assert_close(k_actual, k_expected, rtol=0.02, atol=0.03125)
@@ -92,9 +82,7 @@ def test_qk_rmsnorm_rope_uses_current_stream():
 
 def _adaln_inputs(rows, compact_rows, packed):
     torch.manual_seed(5376 + rows + compact_rows + int(packed))
-    value = torch.randn(
-        rows, HIDDEN_SIZE, device="xpu", dtype=torch.bfloat16
-    )
+    value = torch.randn(rows, HIDDEN_SIZE, device="xpu", dtype=torch.bfloat16)
     weight = torch.randn(HIDDEN_SIZE, device="xpu", dtype=torch.bfloat16)
     if packed:
         modulation = torch.randn(
@@ -113,9 +101,7 @@ def _adaln_inputs(rows, compact_rows, packed):
             dtype=torch.bfloat16,
         )
         shift = torch.randn_like(scale)
-    indices = torch.randint(
-        compact_rows, (rows,), device="xpu", dtype=torch.int64
-    )
+    indices = torch.randint(compact_rows, (rows,), device="xpu", dtype=torch.int64)
     return weight, value, scale, shift, indices
 
 
@@ -123,9 +109,7 @@ def _adaln_reference(weight, value, scale, shift, indices):
     normalized = _rms_norm_reference(value, weight)
     selected_scale = scale.index_select(0, indices)
     selected_shift = shift.index_select(0, indices)
-    return (normalized * (1.0 + selected_scale) + selected_shift).to(
-        torch.bfloat16
-    )
+    return (normalized * (1.0 + selected_scale) + selected_shift).to(torch.bfloat16)
 
 
 @pytest.mark.parametrize("packed", [False, True])
@@ -133,9 +117,7 @@ def _adaln_reference(weight, value, scale, shift, indices):
 def test_indexed_rms_adaln_matches_reference(rows, packed):
     values = _adaln_inputs(rows, 7, packed)
     expected = _adaln_reference(*values)
-    actual = sycl_kernels.fused_minimax_h3_indexed_rms_adaln(
-        *values, eps=EPS
-    )
+    actual = sycl_kernels.fused_minimax_h3_indexed_rms_adaln(*values, eps=EPS)
     assert actual.is_contiguous()
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.03125)
 
