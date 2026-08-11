@@ -2,6 +2,7 @@ from functools import partial
 
 import torch
 import torch.distributed as dist
+from loguru import logger
 
 from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER
 
@@ -18,6 +19,25 @@ class UlyssesAttnWeight(AttnWeightTemplate):
     def __init__(self, a2a_backend="torch"):
         self.config = {}
         self.default_a2a_backend = a2a_backend
+
+    @staticmethod
+    def _xpu_debug_sync(stage, tensor):
+        """Synchronize XPU to identify which async Ulysses stage failed."""
+        if tensor.device.type != "xpu":
+            return
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        tensor_info = f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, device={tensor.device}"
+        logger.info(f"[XPU debug][rank={rank}] synchronizing {stage}; {tensor_info}")
+        try:
+            torch.xpu.synchronize(tensor.device)
+        except RuntimeError as exc:
+            raise RuntimeError(f"XPU debug synchronization failed {stage}; {tensor_info}") from exc
+        logger.info(f"[XPU debug][rank={rank}] synchronized {stage}")
+        try:
+            torch.xpu.empty_cache()
+        except RuntimeError as exc:
+            raise RuntimeError(f"XPU empty_cache failed after {stage}; {tensor_info}") from exc
+        logger.info(f"[XPU debug][rank={rank}] emptied cache after {stage}")
 
     def apply(
         self,
@@ -189,9 +209,12 @@ class UlyssesAttnWeight(AttnWeightTemplate):
         shard_heads = q_heads // world_size
         global_len = local_len * world_size
         aux_len = 0 if aux_q is None else aux_q.shape[0]
+        block_idx = attention_kwargs.get("block_idx", "unknown")
 
         packed_qkv = prepost.pack_qkv(q, k, v, world_size, quant_scheme, qkv_fusion)
+        UlyssesAttnWeight._xpu_debug_sync(f"before block {block_idx} Ulysses QKV all-to-all", q)
         exchanged_qkv = UlyssesAttnWeight._exchange_packed(packed_qkv, a2a, seq_p_group)
+        UlyssesAttnWeight._xpu_debug_sync(f"after block {block_idx} Ulysses QKV all-to-all", exchanged_qkv[0][0])
         attn_q, attn_k, attn_v = prepost.unpack_qkv(
             exchanged_qkv,
             q,
@@ -212,6 +235,7 @@ class UlyssesAttnWeight(AttnWeightTemplate):
             v=attn_v,
             **dense_attention_kwargs,
         ).reshape(attn_q.shape[0], -1)
+        UlyssesAttnWeight._xpu_debug_sync(f"after block {block_idx} attention", attn)
         output, local_aux_attn = split_main_aux_output(attn, global_len, aux_len, aux_first)
 
         packed_attn = prepost.pack_attn(output, local_len, world_size, shard_heads, hidden_dims, quant_scheme)

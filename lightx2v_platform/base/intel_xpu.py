@@ -60,8 +60,9 @@ class IntelXpuDevice:
             raise RuntimeError(f"Intel XPU distributed initialization on non-Linux systems requires PyTorch >= 2.10.0+xpu. Found PyTorch {torch.__version__}.")
 
         local_rank = int(os.environ["LOCAL_RANK"])
-        torch.xpu.set_device(local_rank)
-        dist.init_process_group(backend="xccl")
+        device = torch.device("xpu", local_rank)
+        torch.xpu.set_device(device)
+        dist.init_process_group(backend="xccl", device_id=device)
 
 
 # Register alias "xpu" for backward compatibility

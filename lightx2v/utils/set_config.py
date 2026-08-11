@@ -499,17 +499,33 @@ def set_parallel_config(config):
                 mesh_dim_names.append("seq_p")
             mesh_shape.append(tensor_p_size)
             mesh_dim_names.append("tensor_p")
+            backend_override = (
+                {name: "xpu:xccl" for name in mesh_dim_names}
+                if AI_DEVICE == "xpu"
+                else None
+            )
             config["device_mesh"] = init_device_mesh(
                 AI_DEVICE,
                 tuple(mesh_shape),
                 mesh_dim_names=tuple(mesh_dim_names),
+                backend_override=backend_override,
             )
             config["tensor_parallel"] = True
             config["seq_parallel"] = seq_p_size > 1
             config["cfg_parallel"] = bool(config.get("enable_cfg", False) and cfg_p_size > 1)
         else:
             # Original 2D mesh for cfg_p and seq_p
-            config["device_mesh"] = init_device_mesh(AI_DEVICE, (cfg_p_size, seq_p_size), mesh_dim_names=("cfg_p", "seq_p"))
+            backend_override = (
+                {"cfg_p": "xpu:xccl", "seq_p": "xpu:xccl"}
+                if AI_DEVICE == "xpu"
+                else None
+            )
+            config["device_mesh"] = init_device_mesh(
+                AI_DEVICE,
+                (cfg_p_size, seq_p_size),
+                mesh_dim_names=("cfg_p", "seq_p"),
+                backend_override=backend_override,
+            )
             config["tensor_parallel"] = False
             config["seq_parallel"] = seq_p_size > 1
             config["cfg_parallel"] = bool(config.get("enable_cfg", False) and cfg_p_size > 1)
