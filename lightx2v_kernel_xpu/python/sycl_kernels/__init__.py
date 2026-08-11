@@ -32,8 +32,6 @@ else:
         raise FileNotFoundError(f"libesimd.unify.lgrf.so not found in {_pkg_dir}")
 
 from sycl_kernels._ext import (  # noqa: E402, F401
-    fused_minimax_h3_indexed_rms_adaln,
-    fused_minimax_h3_qk_rmsnorm_rope,
     onednn_w4a16,
     onednn_w8a16_fp8,
     sdp,

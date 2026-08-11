@@ -30,8 +30,6 @@ set(MODULE_NAME _ext)
 set(SYCL_SRCS
     csrc/onednn.cpp
     csrc/onednn_fp8.cpp
-    csrc/minimax_h3.cpp
-    csrc/minimax_h3_adaln.cpp
 )
 set(ALL_SRCS ${SYCL_SRCS} csrc/entry.cpp csrc/sdp.cpp)
 
