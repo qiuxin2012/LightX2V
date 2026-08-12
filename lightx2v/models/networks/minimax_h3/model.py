@@ -171,12 +171,11 @@ class MiniMaxH3Model(BaseTransformerModel):
         # locally instead, so retain the runner-selected CPU/GPU target.
         if not self.use_tp:
             return super()._load_ckpt(unified_dtype, sensitive_layer)
-        load_device = self._checkpoint_load_device()
         logger.info(
             "MiniMax-H3 rank {} (TP rank {}) loading TP checkpoint shards on {}",
             dist.get_rank() if dist.is_initialized() else 0,
             self.tp_rank,
-            load_device,
+            self.device,
         )
         use_tp = self.use_tp
         self.use_tp = False
@@ -192,45 +191,15 @@ class MiniMaxH3Model(BaseTransformerModel):
         files = sorted(glob.glob(os.path.join(checkpoint_path, "*.safetensors"))) if os.path.isdir(checkpoint_path) else [checkpoint_path]
         remove_keys = self.remove_keys if hasattr(self, "remove_keys") else []
         weight_dict = {}
-        load_device = self._checkpoint_load_device()
-        logger.info(f"MiniMax-H3 rank {dist.get_rank() if dist.is_initialized() else 0} loading TP checkpoint shards on {load_device}")
+        logger.info(f"MiniMax-H3 rank {dist.get_rank() if dist.is_initialized() else 0} loading TP checkpoint shards on {self.device}")
         for file_path in files:
             with safe_open(file_path, framework="pt", device="cpu") as source:
                 for key in source.keys():
                     if any(remove_key in key for remove_key in remove_keys):
                         continue
-                    weight_dict[key] = self._load_local_tensor(source, key, load_device)
-        self._validate_checkpoint_devices(weight_dict, load_device)
+                    tensor = self._select_tensor_parallel_shard(key, source.get_tensor(key))
+                    weight_dict[key] = tensor.to(self.device)
         return weight_dict
-
-    def _checkpoint_load_device(self):
-        """Resolve an indexed accelerator device for safetensors."""
-        device = torch.device(self.device)
-        if device.type == "cpu":
-            return "cpu"
-        if device.index is not None:
-            return str(device)
-        device_module = getattr(torch, device.type, None)
-        if device_module is None or not hasattr(device_module, "current_device"):
-            raise RuntimeError(f"Cannot resolve current MiniMax-H3 checkpoint device from {device}")
-        return f"{device.type}:{device_module.current_device()}"
-
-    @staticmethod
-    def _validate_checkpoint_devices(weight_dict, load_device):
-        expected = torch.device(load_device)
-        if expected.type == "cpu":
-            return
-        misplaced = [key for key, tensor in weight_dict.items() if tensor.device != expected]
-        if misplaced:
-            preview = ", ".join(misplaced[:4])
-            raise RuntimeError(f"MiniMax-H3 checkpoint tensors were not loaded on {expected}: {preview}")
-
-    def _load_local_tensor(self, source, key, load_device):
-        """Shard on CPU before copying only this TP rank's tensor to the accelerator."""
-        tensor = self._select_tensor_parallel_shard(key, source.get_tensor(key))
-        if torch.device(load_device).type != "cpu":
-            tensor = tensor.to(load_device)
-        return tensor
 
     def _load_safetensor_to_dict(self, file_path, unified_dtype, sensitive_layer):
         """Load the released mixed-precision tensors without generic dtype coercion."""
@@ -239,17 +208,15 @@ class MiniMaxH3Model(BaseTransformerModel):
             raise ValueError(f"MiniMax-H3 native loading expects the released safetensors checkpoint; got {file_path}")
         remove_keys = self.remove_keys if hasattr(self, "remove_keys") else []
         preserve_keys = self.preserved_keys if hasattr(self, "preserved_keys") else None
-        load_device = self._checkpoint_load_device()
         # Reading a full tensor directly on the accelerator and then slicing it
         # can retain the full safetensors storage behind a small TP view.  Shard
         # on CPU first so accelerator memory contains only this rank's weights.
         with safe_open(file_path, framework="pt", device="cpu") as source:
             weight_dict = {
-                key: self._load_local_tensor(source, key, load_device)
+                key: self._select_tensor_parallel_shard(key, source.get_tensor(key)).to(self.device)
                 for key in source.keys()
                 if not any(remove_key in key for remove_key in remove_keys) and (preserve_keys is None or any(preserve_key in key for preserve_key in preserve_keys))
             }
-        self._validate_checkpoint_devices(weight_dict, load_device)
         return weight_dict
 
     def _init_infer_class(self):
