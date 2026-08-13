@@ -402,10 +402,18 @@ class _Qwen3VLTextBackboneWeights(WeightModule):
     def select_tp_shard(self, name, tensor):
         if self.tp_size == 1:
             return tensor
+        split_dim = self._tp_split_dim(name)
+        if split_dim is None:
+            return tensor
+        if tensor.shape[split_dim] % self.tp_size:
+            raise ValueError(f"Cannot shard Qwen3-VL tensor {name} shape {tuple(tensor.shape)} across text TP size {self.tp_size}")
+        return torch.chunk(tensor, self.tp_size, dim=split_dim)[self.tp_rank].contiguous()
+
+    def _tp_split_dim(self, name):
         is_weight_scale = name.endswith(".weight_scale")
         linear_weight_name = name.removesuffix("_scale") if is_weight_scale else name
         if name == self.embed_tokens.weight_name:
-            split_dim = 0
+            return 0
         elif any(
             pattern in linear_weight_name
             for pattern in (
@@ -416,16 +424,29 @@ class _Qwen3VLTextBackboneWeights(WeightModule):
                 ".mlp.up_proj.weight",
             )
         ):
-            split_dim = 0
+            return 0
         elif ".self_attn.o_proj.weight" in linear_weight_name or ".mlp.down_proj.weight" in linear_weight_name:
             if is_weight_scale:
-                return tensor
-            split_dim = 1
-        else:
-            return tensor
-        if tensor.shape[split_dim] % self.tp_size:
-            raise ValueError(f"Cannot shard Qwen3-VL tensor {name} shape {tuple(tensor.shape)} across text TP size {self.tp_size}")
-        return torch.chunk(tensor, self.tp_size, dim=split_dim)[self.tp_rank].contiguous()
+                return None
+            return 1
+        return None
+
+    def load_tp_shard(self, checkpoint, name):
+        """Read only this rank's safetensors range instead of materializing the full tensor."""
+        if self.tp_size == 1:
+            return checkpoint.get_tensor(name)
+        split_dim = self._tp_split_dim(name)
+        if split_dim is None:
+            return checkpoint.get_tensor(name)
+
+        tensor_slice = checkpoint.get_slice(name)
+        shape = tuple(tensor_slice.get_shape())
+        if shape[split_dim] % self.tp_size:
+            raise ValueError(f"Cannot shard Qwen3-VL tensor {name} shape {shape} across text TP size {self.tp_size}")
+        shard_size = shape[split_dim] // self.tp_size
+        slices = [slice(None)] * len(shape)
+        slices[split_dim] = slice(self.tp_rank * shard_size, (self.tp_rank + 1) * shard_size)
+        return tensor_slice[tuple(slices)].contiguous()
 
     @staticmethod
     def _allocate_layer_buffer(buffer_layer, source_layer):
@@ -852,6 +873,7 @@ class MiniMaxH3Qwen3VLTextEncoder:
             MINIMAX_H3_TEXT_ENCODER_LAYER - 1,
             len(by_shard),
         )
+        keep_weights_on_cpu = bool(backbone.config.get("text_encoder_cpu_offload", backbone.config.get("cpu_offload", False)))
         for shard_index, shard_name in enumerate(sorted(by_shard), start=1):
             shard_path = root / shard_name
             logger.info(
@@ -862,25 +884,37 @@ class MiniMaxH3Qwen3VLTextEncoder:
             )
             with safe_open(shard_path, framework="pt", device="cpu") as checkpoint:
                 for name in by_shard[shard_name]:
-                    one_tensor = {name: backbone.select_tp_shard(name, checkpoint.get_tensor(name))}
+                    tensor = backbone.load_tp_shard(checkpoint, name)
+                    if not keep_weights_on_cpu:
+                        # Loading a CPU tensor through WeightModule first creates a
+                        # pinned host copy.  Move the streamed TP slice directly to
+                        # the accelerator so no large pinned allocation is needed.
+                        tensor = tensor.to(AI_DEVICE)
+                    one_tensor = {name: tensor}
                     module = modules[name]
                     if module is backbone.embed_tokens:
-                        # The released embedding table is about 1.55 GiB.
-                        # EmbeddingWeight's generic CPU path requires one
-                        # monolithic pinned allocation, which some CUDA
-                        # runtimes reject with cudaErrorInvalidValue. Keep the
-                        # immutable host copy pageable; to_cuda()/F.embedding
-                        # remain the same common-op path, only the transfer is
-                        # synchronous when pinning is unavailable.
-                        module.pin_weight = one_tensor.pop(name)
+                        if keep_weights_on_cpu:
+                            # The released embedding table is about 1.55 GiB.
+                            # Keep the immutable host copy pageable rather than
+                            # requesting one monolithic pinned allocation.
+                            module.pin_weight = one_tensor.pop(name)
+                        else:
+                            module.weight = one_tensor.pop(name)
                     else:
                         module.load(one_tensor)
+                        if not keep_weights_on_cpu:
+                            # Device-backed WeightModule.load() retains the
+                            # tensor on the module but does not consume the
+                            # input mapping as the CPU/pinned path does.
+                            one_tensor.pop(name, None)
                     if one_tensor:
                         raise RuntimeError(f"LightX2V weight loader did not consume tensor {name}")
+            logger.info("Finished streaming MiniMax-H3 text shard {}/{}", shard_index, len(by_shard))
 
-        # CPU-loaded common weights keep their canonical copy in pin_weight.
-        # Activate those copies so the object is usable before/after offload.
-        backbone.to_cpu()
+        if keep_weights_on_cpu:
+            # CPU-loaded common weights keep their canonical copy in pin_weight.
+            # Activate those copies so the object is usable before/after offload.
+            backbone.to_cpu()
         return checkpoint_dtypes.pop()
 
     @staticmethod
@@ -902,7 +936,7 @@ class MiniMaxH3Qwen3VLTextEncoder:
             if missing:
                 raise KeyError(f"MiniMax-H3 quantized text encoder checkpoint is missing tensors: {missing[:8]}")
             for primary_name, module in modules.items():
-                tensors = {name: backbone.select_tp_shard(name, checkpoint.get_tensor(name)) for name in tensor_names[primary_name]}
+                tensors = {name: backbone.load_tp_shard(checkpoint, name) for name in tensor_names[primary_name]}
                 if module is backbone.embed_tokens:
                     module.pin_weight = tensors.pop(primary_name)
                 else:
@@ -973,7 +1007,7 @@ class MiniMaxH3Qwen3VLTextEncoder:
             self._load_native_weights(text_encoder, checkpoint_path, text_config)
         if self.block_offload:
             text_encoder.init_block_offload()
-        elif not self.cpu_offload:
+        elif not self.cpu_offload and quantized:
             text_encoder.to_cuda()
         self.text_encoder = text_encoder
         return self.text_encoder

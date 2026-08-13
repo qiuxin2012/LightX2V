@@ -463,6 +463,10 @@ class MiniMaxH3Runner(DefaultRunner):
             raise ValueError("MiniMax-H3 conditioner token tags must be one-dimensional")
         if task == "t2av" and not bool((tags == TEXT_TAG).all()):
             raise ValueError("MiniMax-H3 t2av conditioner returned non-text modality rows")
+        text_encoder = self.text_encoders[0]
+        if not text_encoder.cpu_offload:
+            logger.info("Unloading the native MiniMax-H3 text encoder before moving the transformer to the accelerator")
+            text_encoder.unload_text_encoder()
         self.maybe_empty_cache(force=True, collect_garbage=True)
         return {"text_encoder_output": text_encoder_output}
 
