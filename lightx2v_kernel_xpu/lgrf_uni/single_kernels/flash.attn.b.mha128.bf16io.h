@@ -1,11 +1,11 @@
 // BF16-IO Flash Attention kernel — bf16 input/output, hybrid bf16/fp16 internal
 // Strategy: Q/K stay bf16 (no conversion), V converted bf16→fp16 before SLM scatter.
-//   QK uses bf16 DPAS (same throughput), SxV uses fp16 DPAS + fp16 accumulator.
-//   Compensation is native fp16 multiply (no bf16 ALU overhead).
+//   QK uses bf16 DPAS (same throughput), SxV uses fp16 inputs + fp32 accumulator.
+//   Online-softmax compensation is applied to the fp32 accumulator.
 //   Only 512 bf16→fp16 conversions per loop iteration (V only), vs 8192 for K-converting approach.
 //
 // QK DPAS: dpas<8,8,float,float,bf16,bf16> (bf16 inputs, fp32 accum for softmax precision)
-// S×V DPAS: dpas<8,8,fp16,fp16,fp16,fp16> (fp16 inputs, fp16 accum — native compensation)
+// S×V DPAS: dpas<8,8,float,float,fp16,fp16> (fp16 inputs, fp32 accum)
 // Softmax weights: packed as fp16 VNNI (same as fp16 kernel)
 // Non-causal only.
 
@@ -51,8 +51,10 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
   auto tempBufferAsFp16 = tempBuffer.template bit_cast_view<fp16>();
   auto tempBufferAsBf16 = tempBuffer.template bit_cast_view<bf16>();
   auto ui32Temp = tempBuffer.template bit_cast_view<uint32_t>();
-  // SxV accumulator is fp16 (native compensation multiply)
-  simd<fp16, 16 * 128> finalOutput = 0;
+  // Keep SxV and the online-softmax rescaling in fp32. Real model V values can
+  // be much larger than the unit-normal inputs used by the original UT, for
+  // which an fp16 accumulator introduces output errors of several units.
+  simd<float, 16 * 128> finalOutput = 0;
   simd<float, 16> fp32SoftMaxTemp = 0;
   simd<float, 16> fp32HistoricMaxTemp = FP32_MIN;
   simd<uint32_t, 16> baseOffsetInc16AsVector(baseOffsetInc16);
@@ -255,8 +257,8 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
       fp32SoftMaxTemp.select<16, 1>(0) = fp32SoftMaxTemp.select<16, 1>(0) + ttemp.select<16, 1>(0);
       fp32HistoricMaxTemp = fp32CurrentMaxTemp;
 
-      // Compensation — fp16 multiply (NATIVE on Xe2, same as fp16 kernel)
-      simd<fp16, 32> compensationTemp;
+      // Rescale the historical S×V accumulator without narrowing to fp16.
+      simd<float, 32> compensationTemp;
       compensationTemp.select<16, 1>(0) = fp32SoftMaxCompensation;
       compensationTemp.select<16, 1>(16) = fp32SoftMaxCompensation;
       #pragma unroll
@@ -291,7 +293,7 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
 
     barrier();
 
-    // ===== S×V — fp16 DPAS with V conversion interleaved in first half =====
+    // ===== S×V — fp16 inputs / fp32 DPAS accumulation =====
     // V conversion (32 chunks) hidden behind SxV DPAS: XVE converts while XMX computes
     {
       auto vAsBf16 = fp16VState.template bit_cast_view<bf16>();
@@ -314,8 +316,8 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
             auto ccTile = finalOutput.select<128, 1>(1024 * l + 128 * ll);
             auto aaTile = tempBufferAsFp16.select<256, 1>(256 * nn);
             auto bbTile = tempQkAsFp16.select<128, 1>(1024 + 128 * ll);
-            ccTile = dpas<8, 8, fp16, fp16, fp16, fp16>(
-              simd<fp16, 128>(ccTile.data()),
+            ccTile = dpas<8, 8, float, float, fp16, fp16>(
+              simd<float, 128>(ccTile.data()),
               simd<fp16, 256>(aaTile.data()),
               simd<fp16, 128>(bbTile.data()));
             // V conversion: 1 chunk per DPAS (XVE works while XMX processes DPAS)
@@ -347,8 +349,8 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
             auto ccTile = finalOutput.select<128, 1>(1024 * l + 128 * ll);
             auto aaTile = tempQkAsFp16.select<256, 1>(256 * nn);
             auto bbTile = tempQkAsFp16.select<128, 1>(1024 + 128 * ll);
-            ccTile = dpas<8, 8, fp16, fp16, fp16, fp16>(
-              simd<fp16, 128>(ccTile.data()),
+            ccTile = dpas<8, 8, float, float, fp16, fp16>(
+              simd<float, 128>(ccTile.data()),
               simd<fp16, 256>(aaTile.data()),
               simd<fp16, 128>(bbTile.data()));
           }
@@ -499,7 +501,7 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
       fp32HistoricMaxTemp = fp32CurrentMaxTemp;
 
       if (loopIdx != 0) {
-        simd<fp16, 32> compensationTemp;
+        simd<float, 32> compensationTemp;
         compensationTemp.select<16, 1>(0) = fp32SoftMaxCompensation;
         compensationTemp.select<16, 1>(16) = fp32SoftMaxCompensation;
         #pragma unroll
@@ -535,7 +537,7 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
 
     barrier();
 
-    // S×V — fp16 DPAS (last iteration, no SLM scatter)
+    // S×V — fp16 inputs / fp32 DPAS accumulation (last iteration)
     {
       #pragma unroll
       for (int nn = 0; nn < 2; nn++) {
@@ -555,8 +557,8 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
             auto ccTile = finalOutput.select<128, 1>(1024 * l + 128 * ll);
             auto aaTile = tempBufferAsFp16.select<256, 1>(256 * nn);
             auto bbTile = tempQkAsFp16.select<128, 1>(1024 + 128 * ll);
-            ccTile = dpas<8, 8, fp16, fp16, fp16, fp16>(
-              simd<fp16, 128>(ccTile.data()),
+            ccTile = dpas<8, 8, float, float, fp16, fp16>(
+              simd<float, 128>(ccTile.data()),
               simd<fp16, 256>(aaTile.data()),
               simd<fp16, 128>(bbTile.data()));
           }
@@ -581,8 +583,8 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
             auto ccTile = finalOutput.select<128, 1>(1024 * l + 128 * ll);
             auto aaTile = tempQkAsFp16.select<256, 1>(256 * nn);
             auto bbTile = tempQkAsFp16.select<128, 1>(1024 + 128 * ll);
-            ccTile = dpas<8, 8, fp16, fp16, fp16, fp16>(
-              simd<fp16, 128>(ccTile.data()),
+            ccTile = dpas<8, 8, float, float, fp16, fp16>(
+              simd<float, 128>(ccTile.data()),
               simd<fp16, 256>(aaTile.data()),
               simd<fp16, 128>(bbTile.data()));
           }
@@ -591,7 +593,7 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
     }
   }
 
-  // Output normalization — fp16 accumulator, convert to bf16 at the end
+  // Output normalization — fp32 accumulator, convert to bf16 at the end
   simd<float, 16> softMaxDividor;
   simd<float, 128> alphaV;
   alphaV = block_load<float, 128>((float*)normAlpha + headIdx * 128);
@@ -603,13 +605,13 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
   #pragma unroll
   for (int kk = 0; kk < 64; kk++) {
     simd<float, 32> alphaMul;
-    simd<float, 32> f16Temp = finalOutput.select<32, 1>(32 * kk);
+    simd<float, 32> outputTemp = finalOutput.select<32, 1>(32 * kk);
     alphaMul.select<16, 1>(0) = alphaV[2 * kk] * softMaxDividor.select<16, 1>(0);
     alphaMul.select<16, 1>(16) = alphaV[2 * kk + 1] * softMaxDividor.select<16, 1>(0);
-    f16Temp = f16Temp * alphaMul;
+    outputTemp = outputTemp * alphaMul;
     // Convert fp32 → bf16 directly for output
-    bf16QState.select<16, 2>(32 * kk) = f16Temp.select<16, 1>(0);
-    bf16QState.select<16, 2>(32 * kk + 1) = f16Temp.select<16, 1>(16);
+    bf16QState.select<16, 2>(32 * kk) = outputTemp.select<16, 1>(0);
+    bf16QState.select<16, 2>(32 * kk + 1) = outputTemp.select<16, 1>(16);
   }
 
   simdOffsets = baseOffsetInc16AsVector;

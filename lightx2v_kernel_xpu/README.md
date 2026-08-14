@@ -176,7 +176,7 @@ python test\test_linear.py
 | Kernel | I/O dtype | QK DPAS acc | SV DPAS acc | Notes |
 |--------|-----------|-------------|-------------|-------|
 | `sdp_fp16` | fp16 | fp32 | **fp16** | Native fp16 accumulator on Xe2 — no conversion overhead |
-| `sdp_bf16io` | bf16 | bf16 | **fp16** | bf16 I/O, fp16 internal; V bf16→fp16 hidden in DPAS |
+| `sdp_bf16io` | bf16 | fp32 | **fp32** | bf16 I/O; fp16 S/V inputs with fp32 S×V accumulation |
 
 Both kernels use:
 - doubleGRF (256 registers / thread) compiled AOT for PTL-H

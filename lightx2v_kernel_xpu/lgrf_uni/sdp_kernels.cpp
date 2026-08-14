@@ -68,7 +68,7 @@ extern "C" ESIMD_KERNEL_API void sdp_fp16(
 // sdp_bf16io: BF16 I/O hybrid Flash Attention
 //   Q/K/V/out: raw device pointers to [L, H, 128] bf16 (squeezed from [B,L,H,D])
 //   normAlpha: [H * 128] float32
-//   Internally uses bf16 DPAS for QK, fp16 DPAS + fp16 accumulator for SxV.
+//   Internally uses bf16 DPAS for QK, fp16 DPAS inputs + fp32 accumulator for SxV.
 //   V conversion bf16→fp16 is hidden inside SxV DPAS (zero cost on Xe2).
 // ──────────────────────────────────────────────────────────────────────────────
 extern "C" ESIMD_KERNEL_API void sdp_bf16io(

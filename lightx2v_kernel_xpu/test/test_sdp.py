@@ -15,6 +15,7 @@ import time
 
 import sycl_kernels
 import torch
+import torch.nn.functional as F
 
 DEVICE = "xpu"
 HD = 128
@@ -45,6 +46,36 @@ def check(name, out_f32, ref_f32, thresh=0.15):
     status = "PASS" if ok else "FAIL"
     print(f"  {name}: {status}  max_diff={max_d:.4f}  rel_rms={rms:.2e}  NaN={nan_c}")
     return ok
+
+
+def run_bf16_large_v_regression(q_len=637, kv_len=637, num_heads=4):
+    """Guard the fp32 S×V accumulator with H3-like value magnitudes."""
+    print(f"\n{'=' * 60}")
+    print(f"  BF16 large-V regression: Q/K/V=[{q_len},{num_heads},{HD}]")
+    print(f"{'=' * 60}")
+
+    torch.manual_seed(2026)
+    q = torch.randn(1, q_len, num_heads, HD, dtype=torch.bfloat16, device=DEVICE)
+    k = torch.randn(1, kv_len, num_heads, HD, dtype=torch.bfloat16, device=DEVICE)
+
+    # Make each value channel constant over the KV sequence while spanning the
+    # H3 fixture's [-85.5, 85.5] range. Attention must therefore reproduce the
+    # channel value regardless of its weights. This isolates S×V accumulation
+    # and online-softmax rescaling; random, zero-mean V instead amplifies the
+    # kernel's pre-existing fp16 softmax-weight quantization through cancellation.
+    channel_values = torch.linspace(-85.5, 85.5, num_heads * HD, dtype=torch.float32)
+    v = channel_values.reshape(1, 1, num_heads, HD).expand(1, kv_len, -1, -1)
+    v = v.to(dtype=torch.bfloat16, device=DEVICE).contiguous()
+
+    out = sycl_kernels.sdp(q, k, v)
+    ref = F.scaled_dot_product_attention(
+        q.permute(0, 2, 1, 3),
+        k.permute(0, 2, 1, 3),
+        v.permute(0, 2, 1, 3),
+    ).permute(0, 2, 1, 3)
+
+    # BF16 output rounding remains, but multi-unit accumulator drift must not.
+    assert check("sdp(bf16, large V)", out.float().cpu(), ref.float().cpu(), thresh=0.75)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -161,6 +192,7 @@ if __name__ == "__main__":
     print(f"PyTorch: {torch.__version__}")
     print(f"XPU device: {torch.xpu.get_device_name(0)}")
 
+    run_bf16_large_v_regression()
     run_test("Self-attn  14040x14040", q_len=14040, kv_len=14040)
     run_test("Cross-attn 14040x512 ", q_len=14040, kv_len=512)
 
