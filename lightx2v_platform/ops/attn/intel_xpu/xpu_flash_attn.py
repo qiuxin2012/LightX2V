@@ -40,7 +40,7 @@ except ImportError:
     _sdp_fn = None
 
 
-def _sdp(q4d, k4d, v4d):
+def _sdp(q4d, k4d, v4d, use_fp32_accum=True):
     """
     Unified SDP dispatch.  q4d/k4d/v4d are [1, L, H, D] fp16 or bf16 on XPU.
 
@@ -49,7 +49,7 @@ def _sdp(q4d, k4d, v4d):
                                 (requires layout permute: [B,L,H,D] ↔ [B,H,L,D])
     """
     if _sdp_fn is not None:
-        return _sdp_fn(q4d, k4d, v4d)
+        return _sdp_fn(q4d, k4d, v4d, use_fp32_accum=use_fp32_accum)
 
     # torch SDPA expects [B, H, L, D]
     q_t = q4d.permute(0, 2, 1, 3).contiguous()
@@ -95,6 +95,13 @@ class IntelXpuFlashAttnWeight(AttnWeightTemplate):
         max_seqlen_kv=None,
         **kwargs,
     ):
+        # Do not inspect V with a device reduction here: .item() would
+        # synchronize every attention call. Callers that know V's dynamic
+        # range can override this per call or through the model config.
+        use_fp32_accum = kwargs.pop(
+            "use_fp32_accum",
+            self.config.get("intel_xpu_flash_attn_fp32_accum", True),
+        )
         # ── normalise 4-D input [B, S, H, D] → [B*S, H, D] ──────────────────
         if q.ndim == 4:
             bs = q.shape[0]
@@ -110,7 +117,12 @@ class IntelXpuFlashAttnWeight(AttnWeightTemplate):
         if cu_seqlens_q is None or bs == 1:
             # ── fast single-sequence path ─────────────────────────────────────
             # kernel expects [1, L, H, D]; returns [1, L_q, H, D]
-            x = _sdp(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0))
+            x = _sdp(
+                q.unsqueeze(0),
+                k.unsqueeze(0),
+                v.unsqueeze(0),
+                use_fp32_accum=use_fp32_accum,
+            )
 
             # [1, L_q, H, D] → [L_q, H*D]
             return x.squeeze(0).reshape(total_q, -1)
@@ -129,6 +141,7 @@ class IntelXpuFlashAttnWeight(AttnWeightTemplate):
                 q[qs:qe].unsqueeze(0),
                 k[ks:ke].unsqueeze(0),
                 v[ks:ke].unsqueeze(0),
+                use_fp32_accum=use_fp32_accum,
             )
 
             # [1, L_q, H, D] → [Sq, H*D]

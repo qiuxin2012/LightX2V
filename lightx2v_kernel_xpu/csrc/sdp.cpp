@@ -1,6 +1,6 @@
 // PyTorch wrapper for ESIMD SDP Flash Attention kernels (PTL-H)
 // Input/output layout: [B, L, H, 128]  (B=1, contiguous)
-// Unified dispatch: fp16 → sdp_fp16, bf16 → sdp_bf16io
+// Unified dispatch: fp16 → sdp_fp16, bf16 → selectable SxV accumulator
 
 #include <torch/extension.h>
 
@@ -31,12 +31,13 @@ static void check_sdp_tensor(const torch::Tensor& t, const char* name) {
 //   returns: [1, L_q, H_q, 128]  same dtype as Q
 //
 //   fp16  → sdp_fp16   (optimised FP16 ESIMD kernel)
-//   bf16  → sdp_bf16io (BF16 I/O, FP16 internal ESIMD kernel)
+//   bf16  → fp16 or fp32 SxV accumulator, selected by use_fp32_accum
 // ──────────────────────────────────────────────────────────────────────────────
 torch::Tensor sdp_torch(
     torch::Tensor Q,
     torch::Tensor K,
-    torch::Tensor V)
+    torch::Tensor V,
+    bool use_fp32_accum)
 {
     check_sdp_tensor(Q, "Q");
     check_sdp_tensor(K, "K");
@@ -74,7 +75,10 @@ torch::Tensor sdp_torch(
         case ST::Half:
             dispatch(sdp_fp16);   break;
         case ST::BFloat16:
-            dispatch(sdp_bf16io); break;
+            dispatch(use_fp32_accum
+                         ? sdp_bf16io_fp32_accum
+                         : sdp_bf16io_fp16_accum);
+            break;
         default:
             TORCH_CHECK(false,
                 "sdp: unsupported dtype, only FP16 and BF16 are supported");

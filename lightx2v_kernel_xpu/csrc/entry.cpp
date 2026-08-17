@@ -35,7 +35,8 @@ torch::Tensor onednn_w8a16_fp8(
 torch::Tensor sdp_torch(
     torch::Tensor Q,
     torch::Tensor K,
-    torch::Tensor V
+    torch::Tensor V,
+    bool use_fp32_accum
 );
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -46,5 +47,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("bias") = py::none());
     m.def("sdp", &sdp_torch,
           "ESIMD Flash Attention SDP [B,L,H,128] PTL-H (fp16/bf16)",
-          py::arg("Q"), py::arg("K"), py::arg("V"));
+          py::arg("Q"), py::arg("K"), py::arg("V"),
+          py::arg("use_fp32_accum") = true);
 }

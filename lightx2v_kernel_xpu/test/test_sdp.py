@@ -67,7 +67,7 @@ def run_bf16_large_v_regression(q_len=637, kv_len=637, num_heads=4):
     v = channel_values.reshape(1, 1, num_heads, HD).expand(1, kv_len, -1, -1)
     v = v.to(dtype=torch.bfloat16, device=DEVICE).contiguous()
 
-    out = sycl_kernels.sdp(q, k, v)
+    out = sycl_kernels.sdp(q, k, v, use_fp32_accum=True)
     ref = F.scaled_dot_product_attention(
         q.permute(0, 2, 1, 3),
         k.permute(0, 2, 1, 3),
@@ -100,8 +100,10 @@ def run_test(label, q_len, kv_len, num_heads=12, warmup=10, iters=50):
     K_xpu = K_bf16.unsqueeze(0).to(DEVICE)
     V_xpu = V_bf16.unsqueeze(0).to(DEVICE)
 
-    out_bf16 = sycl_kernels.sdp(Q_xpu, K_xpu, V_xpu)
-    check("sdp(bf16)", out_bf16.squeeze(0).float().cpu(), ref_bf16, thresh=0.15)
+    out_bf16 = sycl_kernels.sdp(Q_xpu, K_xpu, V_xpu, use_fp32_accum=True)
+    check("sdp(bf16, fp32 accum)", out_bf16.squeeze(0).float().cpu(), ref_bf16, thresh=0.15)
+    out_bf16_fast = sycl_kernels.sdp(Q_xpu, K_xpu, V_xpu, use_fp32_accum=False)
+    check("sdp(bf16, fp16 accum)", out_bf16_fast.squeeze(0).float().cpu(), ref_bf16, thresh=0.15)
 
     # ── fp16 correctness ─────────────────────────────────────────────────────
     Q_fp16 = Q_bf16.half()
@@ -128,19 +130,19 @@ def run_test(label, q_len, kv_len, num_heads=12, warmup=10, iters=50):
 
     for _ in range(warmup):
         for q, k, v in bufs:
-            sycl_kernels.sdp(q, k, v)
+            sycl_kernels.sdp(q, k, v, use_fp32_accum=False)
     torch.xpu.synchronize()
 
     t0 = time.perf_counter()
     for i in range(iters):
         q, k, v = bufs[i % 2]
-        sycl_kernels.sdp(q, k, v)
+        sycl_kernels.sdp(q, k, v, use_fp32_accum=False)
     torch.xpu.synchronize()
     elapsed_bf16 = (time.perf_counter() - t0) / iters * 1000
 
     flops = 4.0 * q_len * kv_len * num_heads * HD
     tflops_bf16 = flops / (elapsed_bf16 / 1000) / 1e12
-    print(f"\n  sdp(bf16) perf:  {elapsed_bf16:.2f} ms/iter  |  {tflops_bf16:.1f} TFLOPS")
+    print(f"\n  sdp(bf16, fp16 accum) perf: {elapsed_bf16:.2f} ms/iter  |  {tflops_bf16:.1f} TFLOPS")
 
     # ── fp16 perf ────────────────────────────────────────────────────────────
     bufs16 = [

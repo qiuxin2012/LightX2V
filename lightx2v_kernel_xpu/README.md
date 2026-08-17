@@ -108,11 +108,12 @@ import sycl_kernels
 # ── Flash Attention (SDP) ─────────────────────────────────────────────────────
 # Q, K, V : [B, L, H, 128]  fp16 or bf16  on XPU  (B=1, D=128 required)
 # Returns : [B, L, H, 128]  same dtype as input
-# Dispatch: fp16 → sdp_fp16 kernel,  bf16 → sdp_bf16io kernel
+# Dispatch: fp16 → sdp_fp16; bf16 → selectable fp16/fp32 S×V accumulation
 Q = torch.randn(1, 14040, 12, 128, dtype=torch.bfloat16, device="xpu")
 K = torch.randn(1, 14040, 12, 128, dtype=torch.bfloat16, device="xpu")
 V = torch.randn(1, 14040, 12, 128, dtype=torch.bfloat16, device="xpu")
-out = sycl_kernels.sdp(Q, K, V)                    # [1, 14040, 12, 128] bf16
+out = sycl_kernels.sdp(Q, K, V)                    # fp32 S×V accumulation (default)
+out_fast = sycl_kernels.sdp(Q, K, V, use_fp32_accum=False)  # fp16 fast path
 
 # ── W8A16 FP8 GEMM ────────────────────────────────────────────────────────────
 # x       : [M, K]  fp16 or bf16     on XPU
@@ -141,6 +142,10 @@ out = sycl_kernels.onednn_w4a16(x, weight, scales, zeros, bias)
 ```cmd
 REM Flash Attention — correctness + performance (both fp16 and bf16):
 python test\test_sdp.py
+
+REM Compare BF16 FP16-accumulator and FP32-accumulator kernels:
+python test\benchmark_sdp_accum.py
+python test\benchmark_sdp_accum.py --q-len 637
 
 REM W8A16 FP8 GEMM — correctness + benchmark:
 python test\test_fp8.py
@@ -171,12 +176,13 @@ python test\test_linear.py
 
 ### Flash Attention kernel architecture
 
-`sdp()` dispatches to one of two ESIMD kernels depending on input dtype:
+`sdp()` dispatches by input dtype and, for BF16, by `use_fp32_accum`:
 
 | Kernel | I/O dtype | QK DPAS acc | SV DPAS acc | Notes |
 |--------|-----------|-------------|-------------|-------|
 | `sdp_fp16` | fp16 | fp32 | **fp16** | Native fp16 accumulator on Xe2 — no conversion overhead |
-| `sdp_bf16io` | bf16 | fp32 | **fp32** | bf16 I/O; fp16 S/V inputs with fp32 S×V accumulation |
+| `sdp_bf16io_fp16_accum` | bf16 | fp32 | **fp16** | Fast path for small-magnitude V |
+| `sdp_bf16io_fp32_accum` | bf16 | fp32 | **fp32** | Accurate path for large-magnitude V (default) |
 
 Both kernels use:
 - doubleGRF (256 registers / thread) compiled AOT for PTL-H

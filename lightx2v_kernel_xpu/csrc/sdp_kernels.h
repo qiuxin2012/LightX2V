@@ -22,10 +22,18 @@ ESIMD_KERNEL_API void sdp_fp16(
     int headQ, int headKv,
     void* sycl_queue_ptr);
 
-// BF16 I/O hybrid Flash Attention (bf16 QK DPAS + fp16 SxV DPAS)
+// BF16 I/O hybrid Flash Attention (bf16 QK DPAS + fp16 SxV inputs)
 // Q/K/V/out: [L, H, 128] bf16 device pointers
 // normAlpha: [H*128] float32
-ESIMD_KERNEL_API void sdp_bf16io(
+ESIMD_KERNEL_API void sdp_bf16io_fp16_accum(
+    void* Q, void* K, void* V,
+    void* normAlpha,
+    void* out,
+    int q_len, int kv_len,
+    int headQ, int headKv,
+    void* sycl_queue_ptr);
+
+ESIMD_KERNEL_API void sdp_bf16io_fp32_accum(
     void* Q, void* K, void* V,
     void* normAlpha,
     void* out,
