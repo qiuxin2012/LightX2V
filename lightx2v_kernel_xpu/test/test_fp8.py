@@ -21,6 +21,7 @@ Usage:
 import sys
 import time
 
+import pytest
 import sycl_kernels
 import torch
 
@@ -129,6 +130,23 @@ def test_bias(dtype: torch.dtype = torch.float16):
     print(f"  [attn + bias]  M={M} N={N} K={K}  rel_rms={err:.4f}  {'PASS' if passed else 'FAIL'}")
     print()
     return passed
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_bias_is_applied(dtype):
+    """A zero matmul must return bias, catching a bias-less primitive desc."""
+    if not torch.xpu.is_available():
+        pytest.skip("XPU is not available")
+
+    M, N, K = 8, 64, 128
+    x = torch.zeros((M, K), dtype=dtype, device="xpu")
+    qweight = torch.zeros((N, K), dtype=torch.float8_e4m3fn, device="xpu")
+    scales = torch.ones((N, 1), dtype=torch.float32, device="xpu")
+    bias = torch.randn(N, dtype=dtype, device="xpu")
+
+    out = sycl_kernels.onednn_w8a16_fp8(x, qweight, scales, bias)
+
+    torch.testing.assert_close(out, bias.expand_as(out), rtol=0, atol=0)
 
 
 # ── benchmark ─────────────────────────────────────────────────────────────────

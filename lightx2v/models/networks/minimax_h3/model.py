@@ -22,6 +22,7 @@ from lightx2v.models.networks.minimax_h3.weights.tensor_parallel import unwrap_t
 from lightx2v.utils.envs import GET_DTYPE
 
 H3_CHANNEL_QUANT_SCHEMES = {
+    "fp8-intel-xpu",
     "fp8-q8f",
     "fp8-sgl",
     "fp8-torchao",

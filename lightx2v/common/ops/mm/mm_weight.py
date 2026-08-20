@@ -2679,7 +2679,12 @@ class MMWeightFp8IntelXpu(MMWeightQuantTemplate):
 
         if sycl_kernels is not None:
             try:
-                return sycl_kernels.onednn_w8a16_fp8(input_tensor, self.weight, self.weight_scale.to(torch.float))
+                return sycl_kernels.onednn_w8a16_fp8(
+                    input_tensor,
+                    self.weight,
+                    self.weight_scale.to(torch.float),
+                    self._get_actual_bias(),
+                )
             except RuntimeError:
                 pass  # Fall through to torch dequantization path
 

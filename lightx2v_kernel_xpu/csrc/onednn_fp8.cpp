@@ -80,7 +80,16 @@ static void onednn_w8a16_fp8_impl(
     attr.set_scales_mask(DNNL_ARG_WEIGHTS, 2);
     attr.set_fpmath_mode(dnnl::fpmath_mode::any, /*apply_to_int=*/true);
 
-    dnnl::matmul::primitive_desc pd(eng, x_md, w_md, c_md, attr);
+    // Bias is part of the primitive descriptor, not merely an execution
+    // argument.  Passing DNNL_ARG_BIAS to a bias-less descriptor is accepted
+    // but ignored by oneDNN.
+    dnnl::matmul::primitive_desc pd = bias
+        ? dnnl::matmul::primitive_desc(
+              eng, x_md, w_md,
+              dnnl::memory::desc(
+                  {1, N}, IT, dnnl::memory::format_tag::ab),
+              c_md, attr)
+        : dnnl::matmul::primitive_desc(eng, x_md, w_md, c_md, attr);
 
     // Detect reference fallback so the caller isn't surprised by slow perf
     std::string impl = pd.impl_info_str();
@@ -101,7 +110,8 @@ static void onednn_w8a16_fp8_impl(
 
     if (bias) {
         // Bias dtype matches I/O dtype
-        dnnl::memory::desc bias_md({N}, IT, dnnl::memory::format_tag::a);
+        dnnl::memory::desc bias_md(
+            {1, N}, IT, dnnl::memory::format_tag::ab);
         args.insert({DNNL_ARG_BIAS, dnnl::memory(bias_md, eng, bias)});
     }
 
