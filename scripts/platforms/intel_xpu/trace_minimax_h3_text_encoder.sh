@@ -37,7 +37,7 @@ echo "Trace command: ${trace_tool} ${trace_args[*]}"
   python "${SCRIPT_DIR}/benchmark_minimax_h3_text_encoder.py" \
     --model-path "${model_path}" \
     --config-json "${config_json}" \
-    --warmup "${WARMUP:-1}" \
+    --warmup "${WARMUP:-0}" \
     --iterations "${ITERATIONS:-1}" \
     --output-json "${trace_dir}/benchmark.json" \
     "$@"
