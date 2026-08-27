@@ -1,5 +1,5 @@
 // PyTorch wrapper for ESIMD SDP Flash Attention kernels (PTL-H)
-// Input/output layout: [B, L, H, 128]  (B=1, contiguous)
+// Input/output layout: [B, L, H, D]  (B=1, D=64 or 128, contiguous)
 // Unified dispatch: fp16 → sdp_fp16, bf16 → sdp_bf16io
 
 #include <torch/extension.h>
@@ -9,18 +9,18 @@
 
 using ST = torch::ScalarType;
 
-// Validate tensor: must be XPU, contiguous, [B, L, H, 128], B=1
+// Validate tensor: must be XPU, contiguous, [B, L, H, D], B=1
 static void check_sdp_tensor(const torch::Tensor& t, const char* name) {
     TORCH_CHECK(t.device().type() == c10::DeviceType::XPU,
         name, " must be on XPU");
     TORCH_CHECK(t.is_contiguous(),
         name, " must be contiguous");
     TORCH_CHECK(t.dim() == 4,
-        name, " must be 4-D [B, L, H, 128]");
+        name, " must be 4-D [B, L, H, D]");
     TORCH_CHECK(t.size(0) == 1,
         name, " batch size must be 1");
-    TORCH_CHECK(t.size(3) == 128,
-        name, " head_dim must be 128");
+    TORCH_CHECK(t.size(3) == 64 || t.size(3) == 128,
+        name, " head_dim must be 64 or 128");
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -51,14 +51,17 @@ torch::Tensor sdp_torch(
 
     auto out = torch::empty_like(Q);
 
-    // Cache normAlpha: only reallocate when headQ changes (avoids per-call
+    const int headDim = (int)Q.size(3);
+
+    // Cache normAlpha: only reallocate when its shape changes (avoids per-call
     // XPU malloc + fill-kernel on every sdp() invocation).
     static torch::Tensor s_normAlpha;
-    static int           s_headQ = -1;
-    if (headQ != s_headQ) {
-        s_normAlpha = torch::ones({headQ * 128},
+    static int           s_elements = -1;
+    const int elements = headQ * headDim;
+    if (elements != s_elements || !s_normAlpha.defined() || s_normAlpha.device() != Q.device()) {
+        s_normAlpha = torch::ones({elements},
             torch::dtype(torch::kFloat).device(Q.device()));
-        s_headQ = headQ;
+        s_elements = elements;
     }
     const auto& normAlpha = s_normAlpha;
 
@@ -72,9 +75,9 @@ torch::Tensor sdp_torch(
 
     switch (Q.scalar_type()) {
         case ST::Half:
-            dispatch(sdp_fp16);   break;
+            dispatch(headDim == 64 ? sdp_fp16_hd64 : sdp_fp16); break;
         case ST::BFloat16:
-            dispatch(sdp_bf16io); break;
+            dispatch(headDim == 64 ? sdp_bf16io_hd64 : sdp_bf16io); break;
         default:
             TORCH_CHECK(false,
                 "sdp: unsupported dtype, only FP16 and BF16 are supported");

@@ -2,7 +2,8 @@
 Intel XPU Flash Attention operator for LightX2V.
 
 Uses sycl_kernels.sdp — a hand-written ESIMD/SYCL flash-attention
-kernel for Intel Arc / Meteor Lake / Panther Lake iGPUs.
+kernel for Intel Arc / Meteor Lake / Panther Lake GPUs. It supports
+head dimensions 64 and 128; MiniMax-H3's video VAE uses the HD64 path.
 
 Layout convention (WAN varlen format):
   q / k / v : [S, num_heads, head_dim]   (S = total tokens across batch)
@@ -15,6 +16,7 @@ import warnings
 
 import torch
 import torch.nn.functional as F
+from loguru import logger
 
 from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER
 from lightx2v_platform.ops.attn.template import AttnWeightTemplate
@@ -51,16 +53,29 @@ except ImportError:
     _sycl_mod = None
     _sdp_fn = None
 
+_initialization_logged = False
+_logged_call_signatures = set()
+
+
+def _use_esimd(q4d, k4d):
+    if _sdp_fn is None:
+        return False, "sycl_kernels is unavailable"
+    if q4d.shape[-1] == 64 and (q4d.shape[1] % 256 or k4d.shape[1] % 256):
+        return False, "HD64 sequence length is not 256-aligned"
+    return True, None
+
 
 def _sdp(q4d, k4d, v4d):
     """
-    Unified SDP dispatch.  q4d/k4d/v4d are [1, L, H, D] fp16 or bf16 on XPU.
+    Unified SDP dispatch. q4d/k4d/v4d are [1, L, H, D] fp16 or bf16 on XPU,
+    where D is 64 or 128.
 
     - sycl_kernels available  → hand-written ESIMD Flash Attention
     - fallback                → torch scaled_dot_product_attention
                                 (requires layout permute: [B,L,H,D] ↔ [B,H,L,D])
     """
-    if _sdp_fn is not None:
+    use_esimd, _ = _use_esimd(q4d, k4d)
+    if use_esimd:
         return _sdp_fn(q4d, k4d, v4d)
 
     # torch SDPA expects [B, H, L, D]
@@ -77,6 +92,7 @@ class IntelXpuFlashAttnWeight(AttnWeightTemplate):
     Flash Attention for Intel XPU.
 
     Registered as "intel_xpu_flash_attn".  Select it in a config JSON via:
+        "vae_attn_type":     "intel_xpu_flash_attn"
         "self_attn_1_type":  "intel_xpu_flash_attn"
         "cross_attn_1_type": "intel_xpu_flash_attn"
         "cross_attn_2_type": "intel_xpu_flash_attn"
@@ -94,7 +110,13 @@ class IntelXpuFlashAttnWeight(AttnWeightTemplate):
     """
 
     def __init__(self):
+        global _initialization_logged
+
         self.config = {}
+        if not _initialization_logged:
+            availability = "available" if _sdp_fn is not None else "unavailable; using torch SDPA fallback"
+            logger.info(f"[intel_xpu_flash_attn] ESIMD kernel {availability}")
+            _initialization_logged = True
 
     def apply(
         self,
@@ -107,6 +129,22 @@ class IntelXpuFlashAttnWeight(AttnWeightTemplate):
         max_seqlen_kv=None,
         **kwargs,
     ):
+        is_single = cu_seqlens_q is None or q.ndim != 4 or q.shape[0] == 1
+        path = "single-sequence" if is_single else "varlen"
+        q4d = q if q.ndim == 4 else q.unsqueeze(0)
+        k4d = k if k.ndim == 4 else k.unsqueeze(0)
+        use_esimd, fallback_reason = _use_esimd(q4d, k4d)
+        backend = "sycl_kernels.sdp (ESIMD)" if use_esimd else "torch SDPA fallback"
+        signature = (tuple(q.shape), tuple(k.shape), tuple(v.shape), q.dtype, q.device, path, backend)
+        if signature not in _logged_call_signatures:
+            reason = f", reason={fallback_reason}" if fallback_reason else ""
+            logger.info(
+                "[intel_xpu_flash_attn] attention kernel used: "
+                f"backend={backend}, path={path}, q={tuple(q.shape)}, "
+                f"k={tuple(k.shape)}, v={tuple(v.shape)}, dtype={q.dtype}, device={q.device}{reason}"
+            )
+            _logged_call_signatures.add(signature)
+
         # ── normalise 4-D input [B, S, H, D] → [B*S, H, D] ──────────────────
         if q.ndim == 4:
             bs = q.shape[0]

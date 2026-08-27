@@ -33,4 +33,21 @@ ESIMD_KERNEL_API void sdp_bf16io(
     int headQ, int headKv,
     void* sycl_queue_ptr);
 
+// Head-dimension 64 variants used by the MiniMax-H3 video VAE.
+ESIMD_KERNEL_API void sdp_fp16_hd64(
+    void* Q, void* K, void* V,
+    void* normAlpha,
+    void* out,
+    int q_len, int kv_len,
+    int headQ, int headKv,
+    void* sycl_queue_ptr);
+
+ESIMD_KERNEL_API void sdp_bf16io_hd64(
+    void* Q, void* K, void* V,
+    void* normAlpha,
+    void* out,
+    int q_len, int kv_len,
+    int headQ, int headKv,
+    void* sycl_queue_ptr);
+
 } // extern "C"

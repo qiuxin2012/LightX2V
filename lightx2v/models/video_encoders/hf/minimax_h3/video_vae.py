@@ -554,8 +554,11 @@ class MiniMaxH3VideoVAE(nn.Module):
         super().__init__()
         if quant_scheme not in {None, "fp8-musa", "fp8-sgl"}:
             raise NotImplementedError(f"Unsupported MiniMax-H3 video VAE quantization scheme: {quant_scheme!r}")
-        if attn_type not in {"torch_sdpa", "sage_attn2"}:
-            raise ValueError(f"Unsupported MiniMax-H3 video VAE attention type: {attn_type!r}; expected torch_sdpa or sage_attn2")
+        if attn_type not in {"torch_sdpa", "sage_attn2", "intel_xpu_flash_attn"}:
+            raise ValueError(
+                f"Unsupported MiniMax-H3 video VAE attention type: {attn_type!r}; "
+                "expected torch_sdpa, sage_attn2, or intel_xpu_flash_attn"
+            )
         self.config = dict(config)
         self.execution_device = torch.device(device or AI_DEVICE)
         self.cpu_offload = cpu_offload

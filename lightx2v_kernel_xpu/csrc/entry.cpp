@@ -67,6 +67,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fp8_failure_cache_stats", &fp8_failure_cache_stats,
           "Return FP8 failure cache (failures, negative hits, size)");
     m.def("sdp", &sdp_torch,
-          "ESIMD Flash Attention SDP [B,L,H,128] PTL-H (fp16/bf16)",
+          "ESIMD Flash Attention SDP [B,L,H,D], D=64/128 (fp16/bf16)",
           py::arg("Q"), py::arg("K"), py::arg("V"));
 }

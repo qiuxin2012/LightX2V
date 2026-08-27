@@ -38,7 +38,7 @@ if [[ ! -f "$python_include/Python.h" ]]; then
 fi
 
 echo "=== Step 1: Build ESIMD shared library ==="
-CXX="$CXX" "$project_dir/lgrf_uni/build.sh"
+CXX="$CXX" XPU_TARGET="$XPU_TARGET" "$project_dir/lgrf_uni/build.sh"
 
 echo "=== Step 2: Build Python extension ==="
 "$CMAKE" -GNinja \
