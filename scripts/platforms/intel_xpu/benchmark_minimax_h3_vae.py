@@ -21,6 +21,8 @@ def parse_args():
     parser.add_argument("--height", type=int)
     parser.add_argument("--width", type=int)
     parser.add_argument("--num-frames", type=int)
+    parser.add_argument("--tile-height", type=int)
+    parser.add_argument("--tile-width", type=int)
     parser.add_argument("--output-json")
     parser.add_argument("--cpu-offload", action=argparse.BooleanOptionalAction, default=None)
     return parser.parse_args()
@@ -69,6 +71,8 @@ def main():
     args = parse_args()
     if args.warmup < 0 or args.iterations < 1:
         raise ValueError("--warmup must be >= 0 and --iterations must be >= 1")
+    if (args.tile_height is None) != (args.tile_width is None):
+        raise ValueError("--tile-height and --tile-width must be specified together")
     if not hasattr(torch, "xpu") or not torch.xpu.is_available():
         raise RuntimeError("Intel XPU is unavailable; run with PLATFORM=intel_xpu in an XPU-enabled environment")
 
@@ -125,8 +129,12 @@ def main():
             attn_type=config.get("vae_attn_type", "torch_sdpa"),
         )
         tile_shapes = config.get("vae_decode_tile_shape", {})
-        tile_shape = tile_shapes.get(f"{height}x{width}") if isinstance(tile_shapes, dict) else None
+        tile_shape = (args.tile_height, args.tile_width) if args.tile_height is not None else None
+        if tile_shape is None and isinstance(tile_shapes, dict):
+            tile_shape = tile_shapes.get(f"{height}x{width}")
         if tile_shape:
+            if tile_shape[0] % spatial_scale or tile_shape[1] % spatial_scale:
+                raise ValueError(f"tile height and width must be divisible by VAE scale {spatial_scale}")
             video_vae.set_decode_tile_shape(*tile_shape)
         synchronize()
         load_seconds["video"] = time.perf_counter() - start
@@ -149,6 +157,7 @@ def main():
         "height": height,
         "width": width,
         "num_frames": num_frames,
+        "video_tile_shape": list(tile_shape) if args.component in ("video", "both") and tile_shape else None,
         "warmup": args.warmup,
         "iterations": args.iterations,
         "vae_cpu_offload": cpu_offload,

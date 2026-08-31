@@ -28,6 +28,16 @@ export PYTHONPATH=${PYTHONPATH:+${PYTHONPATH}:}${REPO_ROOT}
 
 echo "MiniMax-H3 model: ${model_path}"
 echo "Benchmark component: ${COMPONENT:-both}"
+if [[ -n "${TILE_HEIGHT:-}" || -n "${TILE_WIDTH:-}" ]]; then
+  [[ -n "${TILE_HEIGHT:-}" && -n "${TILE_WIDTH:-}" ]] || {
+    echo "TILE_HEIGHT and TILE_WIDTH must be set together." >&2
+    exit 1
+  }
+  tile_args=(--tile-height "${TILE_HEIGHT}" --tile-width "${TILE_WIDTH}")
+  echo "Video VAE tile: ${TILE_HEIGHT}x${TILE_WIDTH}"
+else
+  tile_args=()
+fi
 echo "Benchmark result: ${output_json}"
 echo "Trace output: ${trace_dir}"
 
@@ -46,4 +56,5 @@ echo "Trace command: ${trace_tool} ${trace_args[*]}"
   --warmup "${WARMUP:-0}" \
   --iterations "${ITERATIONS:-1}" \
   --output-json "${output_json}" \
+  "${tile_args[@]}" \
   "$@"
