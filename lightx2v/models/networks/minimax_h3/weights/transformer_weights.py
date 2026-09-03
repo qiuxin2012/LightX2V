@@ -1,7 +1,9 @@
 import torch
 import torch.distributed as dist
+from loguru import logger
 
 from lightx2v.common.modules.weight_module import WeightModule, WeightModuleList
+from lightx2v.common.offload.block_slab import pack_cpu_block_slab
 from lightx2v.models.networks.minimax_h3.infer.triton_ops import MiniMaxH3TritonRope  # noqa: F401
 from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER, MM_WEIGHT_REGISTER, RMS_WEIGHT_REGISTER, ROPE_REGISTER
 
@@ -11,7 +13,7 @@ def _linear(config, name, bias=False, create_cuda_buffer=False, tp_split=None):
     if config.get("tensor_parallel", False) and tp_split is not None:
         tp_group = config["device_mesh"].get_group(mesh_dim="tensor_p")
         tp_mm_type = config.get("tp_mm_type", "TensorParallel")
-        return MM_WEIGHT_REGISTER[tp_mm_type](
+        weight = MM_WEIGHT_REGISTER[tp_mm_type](
             weight_name=f"{name}.weight",
             bias_name=f"{name}.bias" if bias else None,
             mm_type=config.get("dit_quant_scheme", "Default"),
@@ -23,12 +25,15 @@ def _linear(config, name, bias=False, create_cuda_buffer=False, tp_split=None):
             create_cuda_buffer=create_cuda_buffer,
             lora_prefix=lora_prefix,
         )
-    return MM_WEIGHT_REGISTER[config.get("dit_quant_scheme", "Default")](
-        f"{name}.weight",
-        f"{name}.bias" if bias else None,
-        create_cuda_buffer=create_cuda_buffer,
-        lora_prefix=lora_prefix,
-    )
+    else:
+        weight = MM_WEIGHT_REGISTER[config.get("dit_quant_scheme", "Default")](
+            f"{name}.weight",
+            f"{name}.bias" if bias else None,
+            create_cuda_buffer=create_cuda_buffer,
+            lora_prefix=lora_prefix,
+        )
+    weight.set_config(config)
+    return weight
 
 
 def _rms(config, name, eps, create_cuda_buffer=False):
@@ -129,6 +134,7 @@ class MiniMaxH3TransformerBlockWeights(WeightModule):
 class MiniMaxH3TransformerWeights(WeightModule):
     def __init__(self, config, lazy_load_path=None, lora_path=None):
         super().__init__()
+        self.config = config
         if config.get("lazy_load", False):
             raise NotImplementedError(
                 "MiniMax-H3 reads the official sharded checkpoint directly; disk lazy_load requires a converted block-sharded checkpoint and is not supported yet. Use lazy_load=false with model or block CPU offload."
@@ -141,3 +147,55 @@ class MiniMaxH3TransformerWeights(WeightModule):
             self.add_module("offload_block_cuda_buffers", self.offload_block_cuda_buffers)
             self.offload_phase_cuda_buffers = None
         self.add_module("blocks", self.blocks)
+
+    def prepare_offload_block_slabs(self):
+        """Pack each CPU block into one pinned transfer allocation."""
+        if not self.config.get("offload_use_block_slab", False):
+            return {}
+        if hasattr(self, "offload_block_slabs"):
+            return self.offload_block_slabs
+
+        slabs = {}
+        for block_idx, block in enumerate(self.blocks):
+            state = block.state_dict()
+            if not state:
+                raise ValueError(f"MiniMax-H3 block {block_idx} has no tensors to pack")
+            non_cpu = [name for name, tensor in state.items() if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu"]
+            if non_cpu:
+                raise ValueError(f"MiniMax-H3 block slab requires CPU tensors; block {block_idx} has invalid entries {non_cpu}")
+            slabs[block_idx] = pack_cpu_block_slab(
+                state,
+                pin_memory=True,
+                strict_pin=True,
+            )
+            self._replace_block_cpu_tensors_with_slab_views(block, slabs[block_idx])
+
+        self.offload_block_slabs = slabs
+        total_bytes = sum(slab.layout.nbytes for slab in slabs.values())
+        logger.info(
+            "MiniMax-H3 packed {} block-offload slabs ({:.2f} GiB per rank)",
+            len(slabs),
+            total_bytes / (1024**3),
+        )
+        return slabs
+
+    @staticmethod
+    def _replace_block_cpu_tensors_with_slab_views(block, slab):
+        """Let weight modules share the slab storage instead of duplicating it."""
+        visited = set()
+
+        def visit(module):
+            if module is None or id(module) in visited:
+                return
+            visited.add(id(module))
+            storage = getattr(module, "_mm", module)
+            for source_name, attr_name, _ in getattr(storage, "base_attrs", ()):
+                pin_attr = f"pin_{attr_name}"
+                if source_name in slab.views and getattr(storage, pin_attr, None) is not None:
+                    setattr(storage, pin_attr, slab.views[source_name])
+            for child in getattr(module, "_parameters", {}).values():
+                visit(child)
+            for child in getattr(module, "_modules", {}).values():
+                visit(child)
+
+        visit(block)

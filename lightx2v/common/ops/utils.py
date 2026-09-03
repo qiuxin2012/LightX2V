@@ -73,26 +73,30 @@ def get_source_tensor(source_name, weight_dict, lazy_load, lazy_load_file, use_i
         return weight_dict[source_name]
 
 
-def create_pin_tensor(tensor, transpose=False, dtype=None):
+def create_pin_tensor(tensor, transpose=False, dtype=None, materialize_transpose=False):
     """Create a tensor with pinned memory for faster data transfer to GPU.
 
     Args:
         tensor: Source tensor to be converted to pinned memory
         transpose: Whether to transpose the tensor after creating pinned memory (optional)
         dtype: Target data type of the pinned tensor (optional, defaults to source tensor's dtype)
+        materialize_transpose: Store a transposed 2-D tensor contiguously instead
+            of returning a transposed view.
 
     Returns:
         Pinned memory tensor (on CPU) with optional transposition applied.
         Falls back to regular CPU tensor if pinned memory allocation fails.
     """
     dtype = dtype or tensor.dtype
+    materialize_transpose = materialize_transpose and transpose and tensor.dim() == 2
+    source_tensor = tensor.t() if materialize_transpose else tensor
     try:
-        pin_tensor = torch.empty(tensor.shape, pin_memory=True, dtype=dtype)
+        pin_tensor = torch.empty(source_tensor.shape, pin_memory=True, dtype=dtype)
     except Exception as e:
-        logger.warning(f"Failed to allocate pinned memory (shape={tensor.shape}, dtype={dtype}): {e}. Falling back to regular CPU memory.")
-        pin_tensor = torch.empty(tensor.shape, dtype=dtype)
-    pin_tensor = pin_tensor.copy_(tensor)
-    if transpose:
+        logger.warning(f"Failed to allocate pinned memory (shape={source_tensor.shape}, dtype={dtype}): {e}. Falling back to regular CPU memory.")
+        pin_tensor = torch.empty(source_tensor.shape, dtype=dtype)
+    pin_tensor = pin_tensor.copy_(source_tensor)
+    if transpose and not materialize_transpose:
         pin_tensor = pin_tensor.t()
     del tensor
     return pin_tensor
@@ -119,7 +123,7 @@ def get_lazy_load_file_path(lazy_load_file, weight_name_for_block=None):
         )
 
 
-def create_cuda_buffers(base_attrs, weight_dict, lazy_load, lazy_load_file, use_infer_dtype=None, scale_force_fp32=False, bias_force_fp32=False):
+def create_cuda_buffers(base_attrs, weight_dict, lazy_load, lazy_load_file, use_infer_dtype=None, scale_force_fp32=False, bias_force_fp32=False, materialize_transpose=False):
     """Create tensor buffers and move them to CUDA device (specified by AI_DEVICE).
 
     Args:
@@ -140,12 +144,14 @@ def create_cuda_buffers(base_attrs, weight_dict, lazy_load, lazy_load_file, use_
         tensor = get_source_tensor(name, weight_dict, lazy_load, lazy_load_file, use_infer_dtype, scale_force_fp32, bias_force_fp32)
         if transpose:
             tensor = tensor.t()
+            if materialize_transpose and tensor.dim() == 2:
+                tensor = tensor.contiguous()
         result[attr_name] = tensor.to(AI_DEVICE)
 
     return result
 
 
-def create_cpu_buffers(base_attrs, lazy_load_file, use_infer_dtype=False, scale_force_fp32=False, bias_force_fp32=False):
+def create_cpu_buffers(base_attrs, lazy_load_file, use_infer_dtype=False, scale_force_fp32=False, bias_force_fp32=False, materialize_transpose=False):
     """Create pinned memory tensor buffers on CPU for lazy loading scenario.
 
     Args:
@@ -164,12 +170,12 @@ def create_cpu_buffers(base_attrs, lazy_load_file, use_infer_dtype=False, scale_
     # Use get_source_tensor to load the tensor (weight_dict is not required when lazy_load=True)
     for name, attr_name, transpose in base_attrs:
         tensor = get_source_tensor(name, {}, lazy_load=True, lazy_load_file=lazy_load_file, use_infer_dtype=use_infer_dtype, scale_force_fp32=scale_force_fp32, bias_force_fp32=bias_force_fp32)
-        result[attr_name] = create_pin_tensor(tensor, transpose=transpose)
+        result[attr_name] = create_pin_tensor(tensor, transpose=transpose, materialize_transpose=materialize_transpose)
 
     return result
 
 
-def create_default_tensors(base_attrs, weight_dict):
+def create_default_tensors(base_attrs, weight_dict, materialize_transpose=False):
     """Create default tensors (device tensors and pinned memory tensors) based on the source weight device.
 
     Args:
@@ -195,7 +201,7 @@ def create_default_tensors(base_attrs, weight_dict):
         for name, attr_name, transpose in base_attrs:
             if name in weight_dict:
                 tensor = weight_dict[name]
-                pin_tensors[attr_name] = create_pin_tensor(tensor, transpose=transpose)
+                pin_tensors[attr_name] = create_pin_tensor(tensor, transpose=transpose, materialize_transpose=materialize_transpose)
                 del weight_dict[name]
     else:
         for name, attr_name, transpose in base_attrs:
@@ -203,6 +209,8 @@ def create_default_tensors(base_attrs, weight_dict):
                 tensor = weight_dict[name]
                 if transpose:
                     tensor = tensor.t()
+                    if materialize_transpose and tensor.dim() == 2:
+                        tensor = tensor.contiguous()
                 device_tensors[attr_name] = tensor
 
     return device_tensors, pin_tensors

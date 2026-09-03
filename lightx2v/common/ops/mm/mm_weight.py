@@ -322,18 +322,19 @@ class MMWeight(MMWeightTemplate):
         )
 
     def load(self, weight_dict):
+        materialize_transpose = bool(self.config.get("use_contiguous_gemm_weight", False))
         if not self.create_cuda_buffer and not self.create_cpu_buffer and not self.lazy_load:
-            device_tensors, pin_tensors = create_default_tensors(self.base_attrs, weight_dict)
+            device_tensors, pin_tensors = create_default_tensors(self.base_attrs, weight_dict, materialize_transpose=materialize_transpose)
             self.weight = device_tensors.get("weight")
             self.bias = device_tensors.get("bias")
             self.pin_weight = pin_tensors.get("weight")
             self.pin_bias = pin_tensors.get("bias")
         elif self.create_cuda_buffer:
-            result = create_cuda_buffers(self.base_attrs, weight_dict, self.lazy_load, self.lazy_load_file)
+            result = create_cuda_buffers(self.base_attrs, weight_dict, self.lazy_load, self.lazy_load_file, materialize_transpose=materialize_transpose)
             self.weight_cuda_buffer = result.get("weight")
             self.bias_cuda_buffer = result.get("bias")
         elif self.create_cpu_buffer:
-            result = create_cpu_buffers(self.base_attrs, self.lazy_load_file)
+            result = create_cpu_buffers(self.base_attrs, self.lazy_load_file, materialize_transpose=materialize_transpose)
             self.pin_weight = result.get("weight")
             self.pin_bias = result.get("bias")
             self.weight = None

@@ -1,5 +1,7 @@
 import torch
+from loguru import logger
 
+from lightx2v.common.offload.event_manager import EventSlotWeightAsyncStreamManager
 from lightx2v.common.offload.manager import WeightAsyncStreamManager
 from lightx2v.models.networks.minimax_h3.infer.transformer_infer import MiniMaxH3TransformerInfer
 from lightx2v_platform.base.global_var import AI_DEVICE
@@ -14,8 +16,12 @@ class MiniMaxH3OffloadTransformerInfer(MiniMaxH3TransformerInfer):
         super().__init__(config)
         offload_granularity = config.get("offload_granularity", "model")
         if offload_granularity == "block":
-            self.offload_manager = WeightAsyncStreamManager(offload_granularity="block")
-            self.infer_func = self.infer_with_blocks_offload
+            self.use_event_offload = bool(config.get("use_event_offload", False))
+            manager_cls = EventSlotWeightAsyncStreamManager if self.use_event_offload else WeightAsyncStreamManager
+            self.offload_manager = manager_cls(offload_granularity="block")
+            self.infer_func = self.infer_with_event_offload if self.use_event_offload else self.infer_with_blocks_offload
+            if self.use_event_offload:
+                logger.info("MiniMax-H3 block offload is using event-protected ping-pong slots")
         elif offload_granularity != "model":
             raise NotImplementedError(f"MiniMax-H3 does not support offload_granularity={offload_granularity!r}")
 
@@ -70,3 +76,55 @@ class MiniMaxH3OffloadTransformerInfer(MiniMaxH3TransformerInfer):
             self.offload_manager.swap_blocks()
 
         return hidden_states
+
+    def infer_with_event_offload(self, blocks, hidden_states, pre_infer_out):
+        """Overlap block H2D copies and compute without host/device-wide barriers."""
+        manager = self.offload_manager
+        num_blocks = len(blocks)
+        if num_blocks == 0:
+            return hidden_states
+
+        current_stream = torch_device_module.current_stream()
+        # Keep XPU collectives and compute on the caller stream, matching the
+        # proven Qwen3-VL event-offload path.  Only H2D copies use the separate
+        # load stream. Other backends retain the dedicated compute stream.
+        compute_stream = current_stream if AI_DEVICE == "xpu" else manager.compute_stream
+        if compute_stream is not current_stream:
+            compute_stream.wait_stream(current_stream)
+
+        scheduled_slots = {}
+        next_block_idx = 0
+
+        def prefetch_next(slot_idx):
+            nonlocal next_block_idx
+            if next_block_idx >= num_blocks:
+                return
+            manager.prefetch_to_slot(slot_idx, next_block_idx, blocks)
+            scheduled_slots[next_block_idx] = slot_idx
+            next_block_idx += 1
+
+        try:
+            for slot_idx in range(min(manager.slot_count, num_blocks)):
+                prefetch_next(slot_idx)
+
+            for block_idx in range(num_blocks):
+                slot_idx = scheduled_slots.pop(block_idx)
+                block = manager.wait_ready(slot_idx, stream=compute_stream)
+                self.block_idx = block_idx
+                with torch_device_module.stream(compute_stream):
+                    hidden_states = self.run_block(block_idx, block, hidden_states, pre_infer_out)
+                manager.record_free(slot_idx, stream=compute_stream)
+                prefetch_next(slot_idx)
+
+            if compute_stream is not current_stream:
+                with torch_device_module.stream(compute_stream):
+                    final_done = compute_stream.record_event()
+                current_stream.wait_event(final_done)
+                hidden_states.record_stream(current_stream)
+            return hidden_states
+        except Exception:
+            # Prevent an in-flight copy from overwriting a slot during retry
+            # or teardown after a failed block.
+            torch_device_module.synchronize()
+            manager.reset_slots()
+            raise

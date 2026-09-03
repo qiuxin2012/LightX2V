@@ -480,6 +480,11 @@ class MiniMaxH3Model(BaseTransformerModel):
         self.post_infer = self.post_infer_class(self.config)
         if hasattr(self.transformer_infer, "offload_manager"):
             self._init_offload_manager()
+            if self.config.get("offload_use_block_slab", False):
+                if not getattr(self.transformer_infer, "use_event_offload", False):
+                    raise ValueError("MiniMax-H3 block slab offload requires use_event_offload=true")
+                slabs = self.transformer_weights.prepare_offload_block_slabs()
+                self.transformer_infer.offload_manager.init_block_slabs(slabs)
 
     @torch.no_grad()
     def _infer_cond_uncond(self, inputs, infer_condition=True):

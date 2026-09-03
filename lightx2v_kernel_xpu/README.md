@@ -173,6 +173,26 @@ REM W4A16 GEMM — correctness + benchmark:
 python test\test_linear.py
 ```
 
+MiniMax-H3 rank-local BF16 GEMM and CUTE FMHA microbenchmark:
+
+```bash
+PYTHONPATH=python python test/bench_minimax_h3_compute.py
+
+# Run only one class of kernels or emit JSON:
+PYTHONPATH=python python test/bench_minimax_h3_compute.py --kernel gemm
+PYTHONPATH=python python test/bench_minimax_h3_compute.py --kernel gemm --gemm-implementation compare
+PYTHONPATH=python python test/bench_minimax_h3_compute.py --kernel gemm --gemm-implementation compare_all
+PYTHONPATH=python python test/bench_minimax_h3_compute.py --kernel attention --json
+```
+
+Its defaults reproduce the 960x544, 124-frame, SP=2/TP=2 VTune shapes. Use
+`--help` to override sequence lengths, attention heads, warmup, or iterations.
+The GEMM cases reproduce MiniMax-H3's default `MMWeight.apply`: a checkpoint
+`[N,K]` weight is transposed once to runtime `[K,N]`, then each invocation uses
+`torch.mm(..., out=...)` with a newly allocated output tensor.
+The attention benchmark runs `[1, 19292, H, 128]` for `H=14,28,56` by
+default; for example, pass `--heads 28 56` to select only two cases.
+
 > Running from source without installing the wheel: set PYTHONPATH first.
 > ```cmd
 > set PYTHONPATH=D:\path\to\lightx2v_kernel_xpu\python;%PYTHONPATH%
