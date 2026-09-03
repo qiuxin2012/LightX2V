@@ -7,6 +7,8 @@ import torch.distributed as dist
 from loguru import logger
 from safetensors import safe_open
 
+from lightx2v.utils.compute_only import SKIP_DISTRIBUTED_COMM
+
 from lightx2v.models.networks.base_model import BaseTransformerModel
 from lightx2v.models.networks.minimax_h3.infer.module_io import MiniMaxH3SequenceParallelState
 from lightx2v.models.networks.minimax_h3.infer.offload import MiniMaxH3OffloadTransformerInfer
@@ -554,6 +556,13 @@ class MiniMaxH3Model(BaseTransformerModel):
         if local_main.shape[0] != state.main_shard_length:
             raise RuntimeError(f"MiniMax-H3 local sequence length changed from {state.main_shard_length} to {local_main.shape[0]}")
         world_size = dist.get_world_size(self.seq_p_group)
+        if SKIP_DISTRIBUTED_COMM:
+            output = torch.cat((output[: state.aux_length], *([local_main] * world_size)), dim=0)
+            pre_infer_out.timestep_indices = state.timestep_indices
+            pre_infer_out.adaln_indices = state.adaln_indices
+            pre_infer_out.rotary_emb = state.rotary_emb
+            pre_infer_out.sequence_parallel_state = None
+            return output
         gathered = [torch.empty_like(local_main) for _ in range(world_size)]
         dist.all_gather(gathered, local_main.contiguous(), group=self.seq_p_group)
         output = torch.cat((output[: state.aux_length], *gathered), dim=0)

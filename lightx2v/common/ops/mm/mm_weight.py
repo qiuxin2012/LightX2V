@@ -25,6 +25,7 @@ from lightx2v.utils.envs import *
 from lightx2v.utils.ggml_tensor import GGMLTensor
 from lightx2v.utils.ggml_tensor import dequantize_tensor as gguf_dequantize_tensor
 from lightx2v.utils.global_paras import CALIB
+from lightx2v.utils.compute_only import SKIP_DISTRIBUTED_COMM
 from lightx2v.utils.quant_utils import FloatQuantizer, IntegerQuantizer
 from lightx2v.utils.registry_factory import MM_WEIGHT_REGISTER
 from lightx2v_platform.base.global_var import AI_DEVICE
@@ -2727,7 +2728,8 @@ class MMWeightTP(MMWeightTemplate):
 
         # For row split, need all-reduce to combine results from all ranks
         if self.split_dim == "row" and self.reduce_output and self.tp_size > 1 and self.tp_group is not None:
-            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.tp_group)
+            if not SKIP_DISTRIBUTED_COMM:
+                dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.tp_group)
             # Add bias after all-reduce (bias is not split for row split)
             if self._row_split_bias is not None:
                 output = output + self._row_split_bias

@@ -37,6 +37,7 @@ torchrun --standalone --nproc_per_node=4 -m lightx2v.infer \
   --task t2av \
   --model_path "${model_path}" \
   --config_json "${config_json}" \
+  --warmup \
   --prompt "${PROMPT:-A cinematic fox walking through a snowy forest}" \
   --save_result_path "${output_path}" \
   --seed "${SEED:-42}"

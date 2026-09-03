@@ -3,6 +3,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from lightx2v.common.transformer_infer.transformer_infer import BaseTransformerInfer
+from lightx2v.utils.compute_only import SKIP_DISTRIBUTED_COMM
 from lightx2v.utils.envs import GET_DTYPE
 
 
@@ -44,6 +45,8 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
     def _gather_tp_last_dim(self, tensor):
         if self.tp_size == 1:
             return tensor
+        if SKIP_DISTRIBUTED_COMM:
+            return torch.cat([tensor] * self.tp_size, dim=-1)
         gathered = [torch.empty_like(tensor) for _ in range(self.tp_size)]
         dist.all_gather(gathered, tensor.contiguous(), group=self.tp_group)
         return torch.cat(gathered, dim=-1)

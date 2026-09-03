@@ -3,6 +3,8 @@ from functools import partial
 import torch
 import torch.distributed as dist
 
+from lightx2v.utils.compute_only import SKIP_DISTRIBUTED_COMM
+
 from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER
 
 from .template import AttnWeightTemplate
@@ -351,6 +353,8 @@ class UlyssesAttnWeight(AttnWeightTemplate):
     def _gather_aux(local_aux, world_size, group):
         if local_aux is None:
             return None
+        if SKIP_DISTRIBUTED_COMM:
+            return torch.cat([local_aux] * world_size, dim=1)
         gathered = [torch.empty_like(local_aux) for _ in range(world_size)]
         dist.all_gather(gathered, local_aux, group=group)
         return torch.cat(gathered, dim=1)

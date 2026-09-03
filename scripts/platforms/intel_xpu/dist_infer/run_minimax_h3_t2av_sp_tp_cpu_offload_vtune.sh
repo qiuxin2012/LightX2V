@@ -27,10 +27,10 @@ export DTYPE=BF16
 export SENSITIVE_LAYER_DTYPE=BF16
 mkdir -p "$(dirname -- "${output_path}")"
 
-torchrun --standalone --nproc_per_node=4 -m lightx2v.infer \
+torchrun --standalone --nproc_per_node=4 --no-python \
+  "${SCRIPT_DIR}/vtune_rank_wrapper.sh" \
   --model_cls minimax_h3 \
   --task t2av \
-  --warmup \
   --model_path "${model_path}" \
   --config_json "${config_json}" \
   --prompt "${PROMPT:-A cinematic fox walking through a snowy forest}" \

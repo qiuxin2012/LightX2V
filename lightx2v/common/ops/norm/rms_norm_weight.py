@@ -5,6 +5,8 @@ import torch.distributed as dist
 from loguru import logger
 from safetensors import safe_open
 
+from lightx2v.utils.compute_only import SKIP_DISTRIBUTED_COMM
+
 from lightx2v.common.ops.norm.triton_ops import (
     fused_norm_3drope,
     fused_qk_norm_3drope,
@@ -288,7 +290,7 @@ class RMSWeightTP(RMSWeightTemplate):
         local_sum = input_tensor.pow(2).sum(-1, keepdim=True)
 
         # All-reduce to get global sum
-        if self.tp_size > 1 and self.tp_group is not None:
+        if self.tp_size > 1 and self.tp_group is not None and not SKIP_DISTRIBUTED_COMM:
             dist.all_reduce(local_sum, op=dist.ReduceOp.SUM, group=self.tp_group)
 
         # Compute global mean: global_sum / hidden_dim
@@ -313,7 +315,7 @@ class RMSWeightTPFP32(RMSWeightTP):
         input_fp32 = input_tensor.float()
         local_sum = input_fp32.square().sum(dim=-1, keepdim=True)
 
-        if self.tp_size > 1 and self.tp_group is not None:
+        if self.tp_size > 1 and self.tp_group is not None and not SKIP_DISTRIBUTED_COMM:
             dist.all_reduce(local_sum, op=dist.ReduceOp.SUM, group=self.tp_group)
 
         global_hidden_dim = input_tensor.shape[-1] * self.tp_size

@@ -3,6 +3,8 @@ from functools import cache
 import torch
 import torch.distributed as dist
 
+from lightx2v.utils.compute_only import SKIP_DISTRIBUTED_COMM
+
 
 @cache
 def _get_round_robin_schedule(world_size, rank):
@@ -34,6 +36,11 @@ class TorchUlyssesA2A:
 
     @staticmethod
     def exchange(input_tensor, group=None, async_op=False):
+        if SKIP_DISTRIBUTED_COMM:
+            # The Ulysses pack/unpack layouts have identical input/output
+            # shapes.  Returning the local packed shard preserves the compute
+            # workload while removing the collective and its device copy.
+            return input_tensor, None
         output_tensor = torch.empty_like(input_tensor)
         work = dist.all_to_all_single(output_tensor, input_tensor, group=group, async_op=async_op)
         return output_tensor, work

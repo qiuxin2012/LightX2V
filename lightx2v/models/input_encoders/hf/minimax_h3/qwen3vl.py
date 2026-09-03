@@ -28,6 +28,8 @@ import torch.nn.functional as F
 from loguru import logger
 from safetensors import safe_open
 
+from lightx2v.utils.compute_only import SKIP_DISTRIBUTED_COMM
+
 from lightx2v.common.modules.weight_module import WeightModule, WeightModuleList
 from lightx2v.common.offload.event_manager import EventSlotWeightAsyncStreamManager
 from lightx2v.common.ops.attn.template import AttnWeightTemplate
@@ -122,7 +124,8 @@ class _Qwen3VLVocabParallelEmbedding(_EmbeddingWeight):
         local_indices = (input_indices - self.vocab_start).masked_fill(outside, 0)
         output = super().apply(local_indices)
         output = output.masked_fill(outside.unsqueeze(-1), 0)
-        dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.tp_group)
+        if not SKIP_DISTRIBUTED_COMM:
+            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.tp_group)
         return output
 
 

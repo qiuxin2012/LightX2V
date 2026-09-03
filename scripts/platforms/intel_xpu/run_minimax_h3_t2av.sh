@@ -28,6 +28,7 @@ prompt=${PROMPT:-A cinematic fox walking through a snowy forest}
 seed=${SEED:-42}
 
 torchrun --standalone --nproc_per_node=1 -m lightx2v.infer \
+  --warmup \
   --model_cls minimax_h3 \
   --task t2av \
   --model_path "${model_path}" \
