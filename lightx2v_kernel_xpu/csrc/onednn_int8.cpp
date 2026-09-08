@@ -184,6 +184,19 @@ std::shared_ptr<PrimitiveState> get_primitive(
 
 }  // namespace
 
+std::tuple<torch::Tensor, torch::Tensor> onednn_quantize_int8_rowwise(
+    torch::Tensor x) {
+    TORCH_CHECK(x.device().is_xpu(), "x must be an XPU tensor");
+    TORCH_CHECK(x.dim() == 2, "x must be 2-D [M, K]");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.scalar_type() == ST::Half || x.scalar_type() == ST::BFloat16,
+                "x must have dtype torch.float16 or torch.bfloat16");
+    if (x.scalar_type() == ST::Half) {
+        return quantize_int8_rowwise<sycl::half>(x);
+    }
+    return quantize_int8_rowwise<sycl::ext::oneapi::bfloat16>(x);
+}
+
 torch::Tensor onednn_w8a8_int8(
     torch::Tensor x,
     torch::Tensor weight,
@@ -265,6 +278,83 @@ torch::Tensor onednn_w8a8_int8(
             DNNL_ARG_BIAS,
             dnnl::memory(
                 state->bias_desc, state->engine, bias_f32.data_ptr()));
+    }
+    state->primitive.execute(stream, arguments);
+    return output;
+}
+
+torch::Tensor onednn_w8a8_int8_prequantized(
+    torch::Tensor output_template,
+    torch::Tensor quantized_x,
+    torch::Tensor x_scales,
+    torch::Tensor weight,
+    torch::Tensor weight_scales,
+    std::optional<torch::Tensor> bias) {
+    TORCH_CHECK(output_template.device().is_xpu(),
+                "output_template must be an XPU tensor");
+    TORCH_CHECK(output_template.scalar_type() == ST::Half ||
+                    output_template.scalar_type() == ST::BFloat16,
+                "output_template must have dtype torch.float16 or torch.bfloat16");
+    TORCH_CHECK(quantized_x.device() == output_template.device() &&
+                    weight.device() == output_template.device() &&
+                    x_scales.device() == output_template.device() &&
+                    weight_scales.device() == output_template.device(),
+                "all tensors must be on the same XPU device");
+    TORCH_CHECK(quantized_x.dim() == 2 && weight.dim() == 2,
+                "quantized_x and weight must be 2-D");
+    TORCH_CHECK(quantized_x.scalar_type() == ST::Char &&
+                    weight.scalar_type() == ST::Char,
+                "quantized_x and weight must have dtype torch.int8");
+    TORCH_CHECK(x_scales.scalar_type() == ST::Float &&
+                    weight_scales.scalar_type() == ST::Float,
+                "activation and weight scales must have dtype torch.float32");
+    TORCH_CHECK(quantized_x.is_contiguous() && weight.is_contiguous() &&
+                    x_scales.is_contiguous() && weight_scales.is_contiguous(),
+                "quantized inputs, weights, and scales must be contiguous");
+
+    const int64_t M = quantized_x.size(0);
+    const int64_t K = quantized_x.size(1);
+    const int64_t N = weight.size(0);
+    TORCH_CHECK(weight.size(1) == K, "weight K dimension must match quantized_x");
+    TORCH_CHECK(x_scales.numel() == M, "x_scales must contain one value per row");
+    TORCH_CHECK(weight_scales.numel() == N,
+                "weight_scales must contain one value per output channel");
+
+    torch::Tensor bias_f32;
+    if (bias.has_value()) {
+        TORCH_CHECK(bias->device() == output_template.device(),
+                    "bias must be on the same XPU device");
+        TORCH_CHECK(bias->dim() == 1 && bias->numel() == N,
+                    "bias must have shape [N]");
+        bias_f32 = bias->to(torch::kFloat32).reshape({1, N}).contiguous();
+    }
+
+    const DT output_type = output_template.scalar_type() == ST::Half
+        ? DT::f16
+        : DT::bf16;
+    auto state = get_primitive(
+        M, K, N, output_type, bias.has_value(), output_template.device());
+    auto output = torch::empty(
+        {M, N}, output_template.options().dtype(output_template.scalar_type()));
+    sycl::queue& queue = utils::get_queue(output_template.device());
+    dnnl::stream stream = dnnl::sycl_interop::make_stream(state->engine, queue);
+    std::unordered_map<int, dnnl::memory> arguments = {
+        {DNNL_ARG_SRC,
+         dnnl::memory(state->src_desc, state->engine, quantized_x.data_ptr())},
+        {DNNL_ARG_WEIGHTS,
+         dnnl::memory(state->weight_desc, state->engine, weight.data_ptr())},
+        {DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC,
+         dnnl::memory(state->src_scale_desc, state->engine, x_scales.data_ptr())},
+        {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS,
+         dnnl::memory(state->weight_scale_desc, state->engine,
+                      weight_scales.data_ptr())},
+        {DNNL_ARG_DST,
+         dnnl::memory(state->output_desc, state->engine, output.data_ptr())},
+    };
+    if (bias.has_value()) {
+        arguments.emplace(
+            DNNL_ARG_BIAS,
+            dnnl::memory(state->bias_desc, state->engine, bias_f32.data_ptr()));
     }
     state->primitive.execute(stream, arguments);
     return output;

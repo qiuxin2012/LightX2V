@@ -33,6 +33,19 @@ torch::Tensor onednn_w8a8_int8(
     std::optional<torch::Tensor> bias
 );
 
+std::tuple<torch::Tensor, torch::Tensor> onednn_quantize_int8_rowwise(
+    torch::Tensor x
+);
+
+torch::Tensor onednn_w8a8_int8_prequantized(
+    torch::Tensor output_template,
+    torch::Tensor quantized_x,
+    torch::Tensor x_scales,
+    torch::Tensor weight,
+    torch::Tensor weight_scales,
+    std::optional<torch::Tensor> bias
+);
+
 torch::Tensor onednn_w8a16_fp8(
     torch::Tensor x,
     torch::Tensor weight,
@@ -56,6 +69,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "oneDNN dynamically quantized W8A8 INT8 GEMM",
           py::arg("x"), py::arg("weight"), py::arg("scales"),
           py::arg("bias") = py::none());
+    m.def("quantize_int8_rowwise", &onednn_quantize_int8_rowwise,
+          "Dynamically quantize FP16/BF16 rows to INT8",
+          py::arg("x"));
+    m.def("onednn_w8a8_int8_prequantized", &onednn_w8a8_int8_prequantized,
+          "oneDNN W8A8 GEMM with prequantized activations",
+          py::arg("output_template"), py::arg("quantized_x"),
+          py::arg("x_scales"), py::arg("weight"),
+          py::arg("weight_scales"), py::arg("bias") = py::none());
     m.def("onednn_w8a16_fp8", &onednn_w8a16_fp8,
           "oneDNN W8A16 FP8 per-N-scale GEMM",
           py::arg("x"), py::arg("weight"), py::arg("scales"),

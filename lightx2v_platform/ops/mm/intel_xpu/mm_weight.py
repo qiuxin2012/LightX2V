@@ -33,6 +33,19 @@ DTYPE_MAP = {
 }
 
 
+def _quantize_int8_rowwise_torch(input_tensor):
+    input_float = input_tensor.float()
+    scales = (input_float.abs().amax(dim=-1) / 127.0).clamp_min(1.0e-30)
+    quantized = torch.round(input_float / scales.unsqueeze(-1)).clamp(-127, 127).to(torch.int8)
+    return quantized, scales
+
+
+_quantize_int8_rowwise_compiled = torch.compile(
+    _quantize_int8_rowwise_torch,
+    fullgraph=True,
+)
+
+
 def GET_DTYPE():
     RUNNING_FLAG = os.getenv("DTYPE", "BF16")
     assert RUNNING_FLAG in ["BF16", "FP16"]
@@ -129,12 +142,27 @@ class MMWeightInt8IntelXpu(MMWeightQuantTemplate):
         original_shape = input_tensor.shape[:-1]
         input_2d = input_tensor.reshape(-1, input_tensor.shape[-1]).contiguous()
         bias = self.bias if hasattr(self, "bias") else None
-        output = sycl_kernels.onednn_w8a8_int8(
-            input_2d,
-            self.weight.contiguous(),
-            self.weight_scale.reshape(-1).float().contiguous(),
-            bias,
-        )
+        quant_impl = os.getenv("LIGHTX2V_XPU_INT8_QUANT_IMPL", "sycl")
+        if quant_impl == "compile":
+            quantize = _quantize_int8_rowwise_torch if torch.compiler.is_compiling() else _quantize_int8_rowwise_compiled
+            quantized_input, input_scales = quantize(input_2d)
+            output = sycl_kernels.onednn_w8a8_int8_prequantized(
+                input_2d,
+                quantized_input,
+                input_scales,
+                self.weight.contiguous(),
+                self.weight_scale.reshape(-1).float().contiguous(),
+                bias,
+            )
+        elif quant_impl == "sycl":
+            output = sycl_kernels.onednn_w8a8_int8(
+                input_2d,
+                self.weight.contiguous(),
+                self.weight_scale.reshape(-1).float().contiguous(),
+                bias,
+            )
+        else:
+            raise ValueError(f"Unsupported LIGHTX2V_XPU_INT8_QUANT_IMPL={quant_impl!r}; expected 'compile' or 'sycl'")
         return output.reshape(*original_shape, self.weight.shape[0])
 
 

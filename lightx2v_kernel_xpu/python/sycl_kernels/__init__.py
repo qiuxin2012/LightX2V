@@ -40,6 +40,8 @@ try:
     from sycl_kernels._ext import (  # noqa: E402, F401
         onednn_w4a16,
         onednn_w8a8_int8,
+        onednn_w8a8_int8_prequantized,
+        quantize_int8_rowwise,
         onednn_w8a16_fp8,
         fp8_cache_clear,
         fp8_cache_stats,
@@ -53,6 +55,8 @@ except ImportError as _legacy_import_error:
 
     onednn_w4a16 = _legacy_extension_unavailable
     onednn_w8a8_int8 = _legacy_extension_unavailable
+    onednn_w8a8_int8_prequantized = _legacy_extension_unavailable
+    quantize_int8_rowwise = _legacy_extension_unavailable
     onednn_w8a16_fp8 = _legacy_extension_unavailable
     fp8_cache_clear = _legacy_extension_unavailable
     fp8_cache_stats = _legacy_extension_unavailable
