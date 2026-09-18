@@ -433,6 +433,41 @@ if(ENABLE_CUTE_FMHA)
         "${CUTLASS_SYCL_ROOT}/applications/flash_attention_v2/collective/fmha_fusion.hpp"
         DESTINATION "${H3_SPARSE_OVERLAY_DIR}")
 
+    # Dense MiniMax-H3 Sage path: INT8 QK DPAS with BF16 PV. It has a private
+    # mainloop/kernel overlay because the score accumulator changes from FP32
+    # to INT32 before per-token scale reconstruction.
+    set(H3_INT8_OVERLAY_ROOT "${CMAKE_BINARY_DIR}/minimax_h3_int8_cute_overlay")
+    set(H3_INT8_COLLECTIVE_DIR "${H3_INT8_OVERLAY_ROOT}/flash_attention_v2/collective")
+    set(H3_INT8_KERNEL_DIR "${H3_INT8_OVERLAY_ROOT}/flash_attention_v2/kernel")
+    file(MAKE_DIRECTORY "${H3_INT8_COLLECTIVE_DIR}" "${H3_INT8_KERNEL_DIR}")
+    configure_file(
+        "${H3_OVERLAY_DIR}/xe_fmha_fwd_mainloop.hpp"
+        "${H3_INT8_COLLECTIVE_DIR}/xe_fmha_fwd_mainloop.hpp" COPYONLY)
+    execute_process(
+        COMMAND patch --batch --forward --fuzz=0
+            ${H3_INT8_COLLECTIVE_DIR}/xe_fmha_fwd_mainloop.hpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/cute/patches/minimax_h3_int8_qk.patch
+        RESULT_VARIABLE H3_INT8_MAINLOOP_RESULT
+        OUTPUT_VARIABLE H3_INT8_MAINLOOP_STDOUT ERROR_VARIABLE H3_INT8_MAINLOOP_STDERR)
+    if(NOT H3_INT8_MAINLOOP_RESULT EQUAL 0)
+        message(FATAL_ERROR "Failed to apply INT8 QK mainloop patch:\n${H3_INT8_MAINLOOP_STDOUT}${H3_INT8_MAINLOOP_STDERR}")
+    endif()
+    set(H3_INT8_KERNEL_TEMP "${H3_INT8_KERNEL_DIR}/xe_fmha_fwd_kernel.hpp.new")
+    execute_process(
+        COMMAND patch --batch --forward --fuzz=0 --output=${H3_INT8_KERNEL_TEMP}
+            ${CUTLASS_SYCL_ROOT}/applications/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/cute/patches/minimax_h3_int8_kernel.patch
+        RESULT_VARIABLE H3_INT8_KERNEL_RESULT
+        OUTPUT_VARIABLE H3_INT8_KERNEL_STDOUT ERROR_VARIABLE H3_INT8_KERNEL_STDERR)
+    if(NOT H3_INT8_KERNEL_RESULT EQUAL 0)
+        message(FATAL_ERROR "Failed to apply INT8 QK kernel patch:\n${H3_INT8_KERNEL_STDOUT}${H3_INT8_KERNEL_STDERR}")
+    endif()
+    configure_file("${H3_INT8_KERNEL_TEMP}" "${H3_INT8_KERNEL_DIR}/xe_fmha_fwd_kernel.hpp" COPYONLY)
+    file(REMOVE "${H3_INT8_KERNEL_TEMP}")
+    file(COPY
+        "${CUTLASS_SYCL_ROOT}/applications/flash_attention_v2/collective/fmha_fusion.hpp"
+        DESTINATION "${H3_INT8_COLLECTIVE_DIR}")
+
     add_library(cute_fmha_minimax_h3_torch SHARED cute/cute_fmha_torch.cpp)
     set_target_properties(cute_fmha_minimax_h3_torch PROPERTIES
         PREFIX ""
@@ -463,6 +498,34 @@ if(ENABLE_CUTE_FMHA)
         -Xspirv-translator
         "-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate")
     target_link_libraries(cute_fmha_minimax_h3_torch PRIVATE
+        ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY})
+
+    add_library(cute_fmha_minimax_h3_int8_torch SHARED cute/cute_fmha_torch.cpp)
+    set_target_properties(cute_fmha_minimax_h3_int8_torch PROPERTIES
+        PREFIX "" BUILD_RPATH "${TORCH_INSTALL_PREFIX}/lib"
+        INSTALL_RPATH "\$ORIGIN;${TORCH_INSTALL_PREFIX}/lib")
+    target_compile_features(cute_fmha_minimax_h3_int8_torch PRIVATE cxx_std_17)
+    target_compile_definitions(cute_fmha_minimax_h3_int8_torch PRIVATE
+        CUTLASS_ENABLE_SYCL SYCL_INTEL_TARGET ${XPU_ARCH_DEFINE}
+        CUTE_FMHA_TORCH_LIBRARY=sycl_kernels_cute_minimax_h3_int8
+        CUTE_FMHA_INT8_QK=1)
+    target_include_directories(cute_fmha_minimax_h3_int8_torch PRIVATE
+        "${CUTLASS_SYCL_ROOT}/include" "${CUTLASS_SYCL_ROOT}/tools/util/include"
+        "${CUTLASS_SYCL_ROOT}/examples/common" "${H3_INT8_OVERLAY_ROOT}"
+        "${CUTLASS_SYCL_ROOT}/applications" "${CMAKE_CURRENT_SOURCE_DIR}/cute"
+        ${TORCH_INCLUDE_DIRS})
+    target_compile_options(cute_fmha_minimax_h3_int8_torch PRIVATE
+        -O3 -fsycl -fsycl-targets=spir64_gen
+        -Xsycl-target-backend "-device ${XPU_TARGET}"
+        -fno-sycl-instrument-device-code -Wno-unknown-pragmas
+        -Wno-unused-variable -Wno-unused-but-set-variable
+        -Wno-unused-local-typedef -Wno-uninitialized -Wno-reorder-ctor
+        -Wno-logical-op-parentheses -Wno-unused-function -Wno-deprecated-copy)
+    target_link_options(cute_fmha_minimax_h3_int8_torch PRIVATE
+        -fsycl -fsycl-targets=spir64_gen
+        -Xsycl-target-backend "-device ${XPU_TARGET}" -Xspirv-translator
+        "-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate")
+    target_link_libraries(cute_fmha_minimax_h3_int8_torch PRIVATE
         ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY})
 
     add_library(cute_fmha_minimax_h3_sparse_torch SHARED cute/cute_fmha_torch.cpp)
@@ -510,5 +573,6 @@ install(FILES "${ESIMD_RUNTIME}" DESTINATION sycl_kernels)
 if(ENABLE_CUTE_FMHA)
     install(TARGETS cute_fmha_torch LIBRARY DESTINATION sycl_kernels)
     install(TARGETS cute_fmha_minimax_h3_torch LIBRARY DESTINATION sycl_kernels)
+    install(TARGETS cute_fmha_minimax_h3_int8_torch LIBRARY DESTINATION sycl_kernels)
     install(TARGETS cute_fmha_minimax_h3_sparse_torch LIBRARY DESTINATION sycl_kernels)
 endif()

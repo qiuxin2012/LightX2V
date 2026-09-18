@@ -113,7 +113,9 @@ template <
     int MmaKOverride = 0,
     int VTileOverride = 0,
     int HeadDimOverride = 0,
-    int KvTileOverride = 0>
+    int KvTileOverride = 0,
+    typename ElementQK = Element,
+    typename ElementOutput = Element>
 struct D128TileKernel {
   using PlatformConfig = cute_fmha_config::ActiveConfig;
   static constexpr int QTile =
@@ -155,10 +157,10 @@ struct D128TileKernel {
 #endif
   static constexpr int GrfSize = PlatformConfig::GRF_SIZE;
 
-  using ElementQ = Element;
-  using ElementK = Element;
+  using ElementQ = ElementQK;
+  using ElementK = ElementQK;
   using ElementV = Element;
-  using ElementO = Element;   // output dtype == input dtype (fp16/bf16)
+  using ElementO = ElementOutput;
 
   using StrideQ = Stride<int, _1, int, int>;
   using StrideK = Stride<int, _1, int, int>;
@@ -167,26 +169,30 @@ struct D128TileKernel {
 
   static constexpr int SGTileQ =
       get<0>(shape_div(ShapeQK{}, shape(SubgroupLayoutQK{})))();
-  using MMAOperation = XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, Element>;
+  using MMAOperationQK = conditional_t<
+      is_same_v<ElementQK, int8_t>,
+      XE_DPAS_TT<cute::gcd(SGTileQ, 8), int32_t, int8_t>,
+      XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, ElementQK>>;
+  using MMAOperationPV = XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, Element>;
   using SubgroupLayoutPV =
       decltype(cutlass::fmha::collective::get_sg_layout_pv(SubgroupLayoutQK{}));
 
   using TiledMMAQK =
-      typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<ShapeQK>, SubgroupLayoutQK>::TiledMMA;
+      typename TiledMMAHelper<MMA_Atom<MMAOperationQK>, Layout<ShapeQK>, SubgroupLayoutQK>::TiledMMA;
   using TiledMMAPV =
-      typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<ShapePV>, SubgroupLayoutPV>::TiledMMA;
+      typename TiledMMAHelper<MMA_Atom<MMAOperationPV>, Layout<ShapePV>, SubgroupLayoutPV>::TiledMMA;
   static constexpr int VTiles = get<1>(ShapeOutput{}) / get<1>(ShapePV{});
 
   static auto make_dummy(Element v, StrideQ s) {
     return make_tensor(make_gmem_ptr(&v), make_layout(repeat<rank_v<StrideQ>>(1), s));
   }
-  using TensorQ = decltype(make_tensor(make_gmem_ptr((Element*)nullptr),
+  using TensorQ = decltype(make_tensor(make_gmem_ptr((ElementQK*)nullptr),
                             make_layout(repeat<rank_v<StrideQ>>(1), StrideQ{})));
-  using TensorK = decltype(make_tensor(make_gmem_ptr((Element*)nullptr),
+  using TensorK = decltype(make_tensor(make_gmem_ptr((ElementQK*)nullptr),
                             make_layout(repeat<rank_v<StrideK>>(1), StrideK{})));
   using TensorV = decltype(make_tensor(make_gmem_ptr((Element*)nullptr),
                             make_layout(repeat<rank_v<StrideV>>(1), StrideV{})));
-  using TensorO = decltype(make_tensor(make_gmem_ptr((Element*)nullptr),
+  using TensorO = decltype(make_tensor(make_gmem_ptr((ElementOutput*)nullptr),
                             make_layout(repeat<rank_v<StrideO>>(1), StrideO{})));
   using TensorK_cache = TensorK;
   using TensorV_cache = TensorV;
@@ -215,7 +221,9 @@ template <
     int MmaKOverride = 0,
     int VTileOverride = 0,
     int HeadDimOverride = 0,
-    int KvTileOverride = 0>
+    int KvTileOverride = 0,
+    typename ElementQK = Element,
+    typename ElementOutput = Element>
 void run_d128_tile(
     const void* q_ptr, const void* k_ptr, const void* v_ptr, void* o_ptr,
     int B, int H, int Lq, int Lkv, int D, float scale,
@@ -226,7 +234,8 @@ void run_d128_tile(
     int64_t k_stride_head = -1, int64_t k_stride_batch = -1,
     int64_t v_stride_seq = -1, int64_t v_stride_head = -1,
     int64_t v_stride_batch = -1, int64_t o_stride_seq = -1,
-    int64_t o_stride_head = -1, int64_t o_stride_batch = -1) {
+    int64_t o_stride_head = -1, int64_t o_stride_batch = -1,
+    const float* q_scale = nullptr, const float* k_scale = nullptr) {
   using KT = D128TileKernel<
       Element,
       PipelineStagesOverride,
@@ -235,7 +244,9 @@ void run_d128_tile(
       MmaKOverride,
       VTileOverride,
       HeadDimOverride,
-      KvTileOverride>;
+      KvTileOverride,
+      ElementQK,
+      ElementOutput>;
   using K    = typename KT::Kernel;
   using PS   = typename KT::ProblemShapeType;
 
@@ -299,14 +310,17 @@ void run_d128_tile(
   typename K::Arguments arguments{
       {
           shape,
-          static_cast<const Element*>(q_ptr), stride_Q,
-          static_cast<const Element*>(k_ptr), stride_K,
+          static_cast<const ElementQK*>(q_ptr), stride_Q,
+          static_cast<const ElementQK*>(k_ptr), stride_K,
           static_cast<const Element*>(v_ptr), stride_V,
-          static_cast<Element*>(o_ptr),       stride_O,
+          static_cast<ElementOutput*>(o_ptr), stride_O,
           nullptr, stride_K,   // k_cache
           nullptr, stride_V,   // v_cache
       },
       {scale, nullptr, 0, nullptr,
+#if defined(CUTE_FMHA_INT8_QK)
+       q_scale, k_scale, H, H, Lq, Lkv,
+#endif
 #if defined(CUTE_FMHA_SPARSE)
        block_lut, H, lut_q_blocks, lut_topk, lut_block_tiles
 #endif
@@ -500,6 +514,49 @@ at::Tensor sparse_sdp(
 }
 #endif
 
+#if defined(CUTE_FMHA_INT8_QK)
+at::Tensor sdp_int8_qk(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    const at::Tensor& q_scale, const at::Tensor& k_scale) {
+  TORCH_CHECK(q.device().is_xpu() && k.device() == q.device() &&
+                  v.device() == q.device() && q_scale.device() == q.device() &&
+                  k_scale.device() == q.device(),
+              "sycl_kernels Sage attention requires one XPU device");
+  TORCH_CHECK(q.scalar_type() == at::kChar && k.scalar_type() == at::kChar,
+              "Sage Q/K must be INT8");
+  TORCH_CHECK(v.scalar_type() == at::kBFloat16,
+              "MiniMax-H3 Sage V must be BF16");
+  TORCH_CHECK(q_scale.scalar_type() == at::kFloat &&
+                  k_scale.scalar_type() == at::kFloat,
+              "Sage Q/K scales must be FP32");
+  TORCH_CHECK(q.dim() == 4 && q.size(0) == 1 && q.size(2) == 56 &&
+                  q.size(3) == 128 &&
+                  (q.size(1) == 21349 || q.size(1) == 41773),
+              "MiniMax-H3 Sage expects Q [1,21349|41773,56,128]");
+  TORCH_CHECK(k.sizes() == q.sizes() && v.sizes() == q.sizes(),
+              "MiniMax-H3 Sage Q/K/V shapes must match");
+  TORCH_CHECK(q_scale.sizes() == at::IntArrayRef({q.size(0), q.size(2), q.size(1)}) &&
+                  k_scale.sizes() == q_scale.sizes(),
+              "MiniMax-H3 Sage scales must be [1,56,L]");
+  TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous() &&
+                  q_scale.is_contiguous() && k_scale.is_contiguous(),
+              "MiniMax-H3 Sage inputs must be contiguous");
+
+  constexpr int B = 1, H = 56, D = 128;
+  const int L = checked_int(q.size(1), "sequence length");
+  auto out = at::empty(v.sizes(), v.options().dtype(at::kBFloat16));
+  const int64_t seq_stride = static_cast<int64_t>(H) * D;
+  const int64_t batch_stride = static_cast<int64_t>(L) * seq_stride;
+  run_d128_tile<cutlass::bfloat16_t, 2, 0, 0, 0, 0, 0, 0, int8_t>(
+      q.data_ptr(), k.data_ptr(), v.data_ptr(), out.data_ptr(), B, H, L, L, D,
+      1.0f / std::sqrt(static_cast<float>(D)), nullptr, 0, 0, 0,
+      seq_stride, D, batch_stride, seq_stride, D, batch_stride,
+      seq_stride, D, batch_stride, seq_stride, D, batch_stride,
+      q_scale.const_data_ptr<float>(), k_scale.const_data_ptr<float>());
+  return out;
+}
+#endif
+
 }  // namespace
 }  // namespace CUTE_FMHA_TORCH_LIBRARY
 
@@ -511,6 +568,9 @@ TORCH_LIBRARY(CUTE_FMHA_TORCH_LIBRARY, m) {
 #if defined(CUTE_FMHA_SPARSE)
   m.def("sparse_sdp(Tensor q, Tensor k, Tensor v, Tensor block_lut) -> Tensor");
 #endif
+#if defined(CUTE_FMHA_INT8_QK)
+  m.def("sdp_int8_qk(Tensor q, Tensor k, Tensor v, Tensor q_scale, Tensor k_scale) -> Tensor");
+#endif
 }
 
 TORCH_LIBRARY_IMPL(CUTE_FMHA_TORCH_LIBRARY, XPU, m) {
@@ -520,5 +580,8 @@ TORCH_LIBRARY_IMPL(CUTE_FMHA_TORCH_LIBRARY, XPU, m) {
 #endif
 #if defined(CUTE_FMHA_SPARSE)
   m.impl("sparse_sdp", &CUTE_FMHA_TORCH_LIBRARY::sparse_sdp);
+#endif
+#if defined(CUTE_FMHA_INT8_QK)
+  m.impl("sdp_int8_qk", &CUTE_FMHA_TORCH_LIBRARY::sdp_int8_qk);
 #endif
 }

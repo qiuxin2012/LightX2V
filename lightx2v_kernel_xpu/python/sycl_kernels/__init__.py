@@ -11,6 +11,7 @@ _rms_norm_loaded = False
 _minimax_h3_rope_loaded = False
 _minimax_h3_qkv_norm_loaded = False
 _sla_router_loaded = False
+_cute_fmha_minimax_h3_int8_loaded = False
 
 if os.name == "nt":
     os.add_dll_directory(_pkg_dir)
@@ -236,6 +237,19 @@ def _load_cute_fmha_minimax_h3_sparse():
     _cute_fmha_minimax_h3_sparse_loaded = True
 
 
+def _load_cute_fmha_minimax_h3_int8():
+    global _cute_fmha_minimax_h3_int8_loaded
+    if _cute_fmha_minimax_h3_int8_loaded:
+        return
+    import torch
+
+    candidates = sorted(glob.glob(os.path.join(_pkg_dir, "cute_fmha_minimax_h3_int8_torch*.so")))
+    if not candidates:
+        raise ImportError("cute_fmha_minimax_h3_int8_torch.so not found")
+    torch.ops.load_library(candidates[0])
+    _cute_fmha_minimax_h3_int8_loaded = True
+
+
 def _use_minimax_h3_cute(q, k, v):
     import torch
 
@@ -329,3 +343,38 @@ def sla_sparse_attention(q, k, v, keep_ratio=0.2, block_q=128, block_k=128, scal
     from .sla import sla_sparse_attention as _sla_sparse_attention
 
     return _sla_sparse_attention(q, k, v, keep_ratio, block_q, block_k, scale)
+
+
+def sage_attention(q, k, v, is_causal=False, scale=None, smooth_k=True):
+    """Run Sage-style per-token INT8-QK attention on Intel XPU."""
+    from .sage_int8 import sage_attention as _sage_attention
+
+    return _sage_attention(q, k, v, is_causal=is_causal, scale=scale, smooth_k=smooth_k)
+
+
+def minimax_h3_sage_attention(q, k, v):
+    """Dense INT8-QK Sage attention for the MiniMax-H3 DiT contract."""
+    import torch
+
+    expected = (1, q.shape[1], 56, 128) if q.ndim == 4 else None
+    if (
+        q.device.type != "xpu"
+        or q.dtype != torch.bfloat16
+        or tuple(q.shape) != expected
+        or q.shape[1] not in (21349, 41773)
+        or tuple(k.shape) != tuple(q.shape)
+        or tuple(v.shape) != tuple(q.shape)
+    ):
+        raise ValueError(
+            "minimax_h3_sage_attention requires BF16 XPU Q/K/V shaped "
+            "[1, 21349|41773, 56, 128]"
+        )
+    from .sage_int8 import quantize_qk_blhd
+
+    _load_cute_fmha_minimax_h3_int8()
+    # MiniMax-H3 applies Q/K RMSNorm before attention. Skipping the redundant
+    # sequence-mean pass keeps the complete INT8 path below the dense baseline.
+    qi, ki, qs, ks = quantize_qk_blhd(q, k, smooth_k=False)
+    out = torch.ops.sycl_kernels_cute_minimax_h3_int8.sdp_int8_qk(
+        qi, ki, v.contiguous(), qs, ks)
+    return out

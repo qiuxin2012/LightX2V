@@ -1,0 +1,91 @@
+--- xe_fmha_fwd_mainloop.hpp
++++ xe_fmha_fwd_mainloop.hpp
+@@ -133,9 +133,10 @@
+   using FragC = decltype(TiledMMA{}.get_slice(0).partition_sg_fragment_C(
+                            make_identity_tensor(select<0,1>(TiledMMA{}.tile_mnk()))));
+ 
+-  using FragS = FragC<TiledMMAQK>;
++  using FragSRaw = FragC<TiledMMAQK>;
++  using FragS = decltype(make_subgroup_tensor<float>(FragSRaw{}.tv_layout()));
+   using FragSRow = decltype(reduce<1>(FragS{}, sycl::plus<void>{}));
+-  using ElementS = typename TiledMMAQK::ValTypeD;
++  using ElementS = float;
+ 
+   using SingleFragA = FragC<TiledMMAPV>;                          // (atom val,q',v')
+   using FragA = expand_sg_fragment_t<SingleFragA, 1, VTiles>;     // (atom val,q',v',VV)
+@@ -152,6 +153,12 @@
+     int const* ptr_page_table = nullptr;
+     int page_size = 0;
+     int const* num_pages_per_seq = nullptr;
++    float const* q_scale = nullptr;
++    float const* k_scale = nullptr;
++    int q_heads = 0;
++    int kv_heads = 0;
++    int q_len = 0;
++    int kv_len = 0;
+   };
+ 
+   // Kernel-facing parameters
+@@ -172,7 +179,9 @@
+   Params to_underlying_arguments(Arguments const &args, void * /* workspace */) {
+     constexpr double kLog2e = 1.4426950408889634074;            // log_2(e)
+     ElementS val = args.scale * static_cast<ElementS>(kLog2e);
+-    return Params{val, args.ptr_page_table, args.page_size, args.num_pages_per_seq};
++    return Params{val, args.ptr_page_table, args.page_size, args.num_pages_per_seq,
++                  args.q_scale, args.k_scale, args.q_heads, args.kv_heads,
++                  args.q_len, args.kv_len};
+   }
+ 
+   CUTLASS_HOST_DEVICE static
+@@ -213,6 +222,8 @@
+              int              l_coord,
+              int              full_tile_offset,
+              int              discard_seq_coord,
++             int              head_q,
++             int              head_kv,
+             TensorK_cache2D const& K_cache_2D = TensorK_cache2D{},
+             TensorV_cache2D const& V_cache_2D = TensorV_cache2D{}) {
+     using namespace sycl::ext::oneapi::this_work_item;
+@@ -281,7 +292,8 @@
+     auto tKrK = thr_copy_k.partition_sg_fragment_D(gK(_,_,0,0));
+     auto tSrK = thr_mma_qk.partition_sg_fragment_B(gK(_,_,0,0));
+ 
+-    auto tSrS = thr_mma_qk.partition_sg_fragment_C(cP);
++    auto tSrS_raw = thr_mma_qk.partition_sg_fragment_C(cP);
++    auto tSrS = make_subgroup_tensor<float>(tSrS_raw.tv_layout());
+     auto tArP = thr_mma_pv.partition_sg_fragment_A(cP);
+ 
+     auto tVrV = thr_copy_v.partition_sg_fragment_D(gV_split(_,_,0,0));
+@@ -362,7 +374,7 @@
+       }
+ 
+       /* GEMM 1: S = K * Q */
+-      clear(tSrS);
++      clear(tSrS_raw);
+       CUTLASS_PRAGMA_UNROLL
+       for (int D = 0; D < size<4>(tKgK); D++) {
+         if (D == 0) {
+@@ -374,7 +386,22 @@
+         copy(copy_k_cur, tKgK_cur(_,_,_,k_idx,D), tKrK);
+         reorder(tKrK, tSrK);
+ 
+-        cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
++        cute::gemm(mma_qk, tSrQ, tSrK, tSrS_raw);
++      }
++
++      Tensor cPgP_scale = local_tile(
++          make_identity_tensor(make_shape(seq_len, seq_len)),
++          take<0,2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
++      auto cS_scale = thr_mma_qk.partition_C(cPgP_scale);
++      CUTLASS_PRAGMA_UNROLL
++      for (int i = 0; i < tSrS.size(); ++i) {
++        int q_idx = get<0>(cS_scale(i));
++        int k_idx_scale = get<1>(cS_scale(i));
++        float qs = params.q_scale[
++            (l_coord * params.q_heads + head_q) * params.q_len + q_idx];
++        float ks = params.k_scale[
++            (l_coord * params.kv_heads + head_kv) * params.kv_len + k_idx_scale];
++        tSrS(i) = static_cast<float>(tSrS_raw(i)) * qs * ks;
+       }
+ 
+       /* Causal masking - only in non-cache mode */

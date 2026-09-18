@@ -113,6 +113,24 @@ pip install dist\sycl_kernels-0.0.1-cp311-win_amd64.whl --force-reinstall --no-d
 
 ## Usage
 
+### Sage-style INT8 QK attention
+
+`sycl_kernels.sage_attention(q, k, v)` implements dense attention with
+per-token INT8 Q/K quantization, K mean smoothing, INT8 XMX/DPAS QK, and
+FP16/BF16 PV. Inputs use contiguous `[B, L, H, D]` layout with head dimension
+64 or 128; GQA and causal self-attention are supported.
+
+```python
+from sycl_kernels import sage_attention
+
+out = sage_attention(q, k, v, is_causal=False)
+```
+
+For the MiniMax-H3 DiT contract (`BF16`, `D=128`, 56 heads, and 21349 or
+41773 tokens), use `minimax_h3_sage_attention(q, k, v)`. This path uses the
+native CUTE INT8-DPAS kernel. It omits K mean smoothing because MiniMax-H3
+already applies Q/K RMSNorm before attention.
+
 ```python
 import torch
 import sycl_kernels
