@@ -61,6 +61,32 @@ def sla_block_map(
     if hq % hkv != 0:
         raise ValueError(f"query heads ({hq}) must be divisible by KV heads ({hkv})")
 
+    # The tuned MiniMax-H3 path performs routing in exactly two XPU launches:
+    # fused Q/K pooling, then XMX/DPAS score plus Top-K/LUT construction. Subtracting
+    # the global K mean changes every score for a query block by the same
+    # constant and therefore cannot change its Top-K set.
+    if (
+        q.device.type == "xpu"
+        and q.dtype == torch.bfloat16
+        and q.shape == k.shape
+        and q.shape[-1] == 128
+        and block_q == 128
+        and block_k == 128
+        and math.ceil(k.shape[1] / block_k) <= 512
+        and q.is_contiguous()
+        and k.is_contiguous()
+    ):
+        from . import _load_sla_router
+
+        try:
+            op = torch.ops.sycl_kernels_sla_router.route
+        except AttributeError:
+            _load_sla_router()
+            op = torch.ops.sycl_kernels_sla_router.route
+        key_blocks = math.ceil(k.shape[1] / block_k)
+        topk = max(1, min(key_blocks, int(keep_ratio * key_blocks)))
+        return op(q, k, topk)
+
     pooled_q = _block_mean_blhd(q, block_q)
     pooled_k = _block_mean_blhd(k, block_k)
     pooled_k = pooled_k - k.mean(dim=1).unsqueeze(2)

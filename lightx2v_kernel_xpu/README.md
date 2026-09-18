@@ -366,5 +366,24 @@ Benchmark the kernel, router, and dense CUTE baseline separately with:
 
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 PYTHONPATH=python \
-  python test/bench_sla_sparse_attention.py
+  python test/bench_sla_sparse_attention.py --output sla_vs_dense.json
 ```
+
+The JSON report compares dense attention with both the SLA kernel alone
+(prebuilt LUT) and end-to-end SLA (routing plus sparse attention). It includes
+latency distributions, speedups, peak incremental XPU memory, and FP32-reduced
+MAE/RMSE/relative-L2/cosine output-quality metrics against dense attention.
+Q/K/V are allocated before peak-memory collection, so `peak_delta_bytes`
+captures operator outputs and temporary workspace rather than common inputs.
+The default MiniMax-H3 packed sequence is 41,773 tokens: 2,047 text, 414
+audio, and 39,312 video tokens. Use `--sequence-length` only to benchmark a
+custom synthetic length; the JSON marks whether it still matches the reported
+modality sum.
+
+For the optimized BF16/D128/128x128 contract, SLA routing uses two device
+kernels: an ESIMD kernel that pools Q and K together, followed by a kernel that
+uses XMX/DPAS for block-score calculation and fuses Top-K selection with int32
+LUT output.
+The Smooth-K subtraction is omitted in the fused path because it subtracts the
+same scalar from every key-block score for a given query block and therefore
+does not change the mathematical Top-K set.

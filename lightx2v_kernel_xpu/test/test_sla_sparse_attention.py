@@ -56,6 +56,17 @@ def test_full_lut_reference_matches_dense_gqa():
 
 
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is unavailable")
+def test_xpu_two_kernel_router_matches_original_semantics():
+    torch.manual_seed(13)
+    q = torch.randn(1, 257, 4, 128, device="xpu", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    actual = sla_block_map(q, k, keep_ratio=0.5, block_q=128, block_k=128)
+    expected = _explicit_router(q, k, 0.5, 128, 128)
+    torch.xpu.synchronize()
+    torch.testing.assert_close(actual.sort(dim=-1).values.long(), expected.sort(dim=-1).values)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is unavailable")
 def test_xpu_sparse_kernel_matches_reference():
     torch.manual_seed(5)
     q = torch.randn(1, 257, 4, 128, device="xpu", dtype=torch.bfloat16)

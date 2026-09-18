@@ -10,6 +10,7 @@ _cute_fmha_minimax_h3_sparse_loaded = False
 _rms_norm_loaded = False
 _minimax_h3_rope_loaded = False
 _minimax_h3_qkv_norm_loaded = False
+_sla_router_loaded = False
 
 if os.name == "nt":
     os.add_dll_directory(_pkg_dir)
@@ -173,6 +174,20 @@ def has_minimax_h3_qkv_norm_rope():
         return hasattr(torch.ops.sycl_kernels_minimax_h3_qkv, "qkv_norm_rope")
     except (ImportError, OSError, RuntimeError):
         return False
+
+
+def _load_sla_router():
+    global _sla_router_loaded
+    if _sla_router_loaded:
+        return
+    import torch
+
+    suffix = "*.pyd" if os.name == "nt" else "*.so"
+    candidates = sorted(glob.glob(os.path.join(_pkg_dir, "sla_router_torch" + suffix)))
+    if not candidates:
+        raise ImportError(f"sla_router_torch library not found in {_pkg_dir}")
+    torch.ops.load_library(candidates[0])
+    _sla_router_loaded = True
 
 
 def _load_cute_fmha():

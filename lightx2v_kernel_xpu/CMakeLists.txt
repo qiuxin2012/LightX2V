@@ -226,6 +226,20 @@ add_sycl_to_target(TARGET minimax_h3_qkv_norm_torch
 target_link_libraries(minimax_h3_qkv_norm_torch PRIVATE
     ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY})
 
+# Two-launch MiniMax-H3 SLA router: fused Q/K pooling followed by XMX/DPAS
+# score calculation and fused Top-K/LUT construction.
+add_library(sla_router_torch SHARED csrc/sla_router.cpp)
+set_target_properties(sla_router_torch PROPERTIES
+    PREFIX ""
+    BUILD_RPATH "${TORCH_INSTALL_PREFIX}/lib"
+    INSTALL_RPATH "\$ORIGIN;${TORCH_INSTALL_PREFIX}/lib")
+target_compile_features(sla_router_torch PRIVATE cxx_std_17)
+target_include_directories(sla_router_torch PRIVATE
+    ${Python_INCLUDE_DIRS} ${TORCH_INCLUDE_DIRS})
+add_sycl_to_target(TARGET sla_router_torch SOURCES csrc/sla_router.cpp)
+target_link_libraries(sla_router_torch PRIVATE
+    ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY})
+
 if(ENABLE_CUTE_FMHA)
     if(WIN32)
         message(FATAL_ERROR
@@ -491,6 +505,7 @@ install(TARGETS ${MODULE_NAME} LIBRARY DESTINATION sycl_kernels)
 install(TARGETS rms_norm_torch LIBRARY DESTINATION sycl_kernels)
 install(TARGETS minimax_h3_rope_torch LIBRARY DESTINATION sycl_kernels)
 install(TARGETS minimax_h3_qkv_norm_torch LIBRARY DESTINATION sycl_kernels)
+install(TARGETS sla_router_torch LIBRARY DESTINATION sycl_kernels)
 install(FILES "${ESIMD_RUNTIME}" DESTINATION sycl_kernels)
 if(ENABLE_CUTE_FMHA)
     install(TARGETS cute_fmha_torch LIBRARY DESTINATION sycl_kernels)
