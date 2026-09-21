@@ -37,7 +37,6 @@ class QwenImage21Runner(DefaultRunner):
 
     def __init__(self, config):
         unsupported = (
-            "cpu_offload",
             "vae_cpu_offload",
             "lazy_load",
             "unload_modules",
@@ -56,11 +55,13 @@ class QwenImage21Runner(DefaultRunner):
         for key in unsupported:
             if config.get(key):
                 raise ValueError(f"qwen_image_21 does not yet support {key}")
+        if config.get("cpu_offload") and config.get("offload_granularity", "model") != "model":
+            raise ValueError("qwen_image_21 supports only model-level CPU offload")
         if config.get("dit_quantized"):
-            if config.get("dit_quant_scheme") not in ("fp8-sgl", "fp8-f16-accum"):
-                raise ValueError("qwen_image_21 DiT quantization supports only fp8-sgl and fp8-f16-accum")
+            if config.get("dit_quant_scheme") not in ("fp8-sgl", "fp8-f16-accum", "int8-intel-xpu"):
+                raise ValueError("qwen_image_21 DiT quantization supports only fp8-sgl, fp8-f16-accum, and int8-intel-xpu")
             if not config.get("dit_quantized_ckpt"):
-                raise ValueError("qwen_image_21 FP8 requires dit_quantized_ckpt")
+                raise ValueError("qwen_image_21 quantization requires dit_quantized_ckpt")
             if config["dit_quant_scheme"] == "fp8-f16-accum":
                 validate_fp8_f16_accum_qmax(config.get("dit_fp8_activation_qmax", ACTIVATION_QMAX))
         elif config.get("dit_quant_scheme", "Default") != "Default":
@@ -247,10 +248,28 @@ class QwenImage21Runner(DefaultRunner):
     @ProfilingContext4DebugL1("RUN pipeline")
     def run_pipeline(self, input_info):
         self.input_info = input_info
+        transformer_onloaded = False
         try:
             self.inputs = self.run_input_encoder()
+            if self.config.get("cpu_offload"):
+                with ProfilingContext4DebugL1("Onload Transformer"):
+                    self.model.to_cuda()
+                    self.model.device = torch.device(AI_DEVICE)
+                    transformer_onloaded = True
             latents = self.run_main()
+            if self.config.get("cpu_offload"):
+                with ProfilingContext4DebugL1("Offload Transformer"):
+                    self.model.clear_condition_kv()
+                    self.model.to_cpu()
+                    self.model.device = torch.device("cpu")
+                    torch_device_module.empty_cache()
+                    transformer_onloaded = False
             value = self.run_vae_decoder(latents)
             return self.process_images_after_vae_decoder(value)
         finally:
+            if transformer_onloaded:
+                self.model.clear_condition_kv()
+                self.model.to_cpu()
+                self.model.device = torch.device("cpu")
+                torch_device_module.empty_cache()
             self.end_run()
